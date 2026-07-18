@@ -3,7 +3,7 @@
 # Copyright (C) 2026 Jakub Kreczetowski <kret1315@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import copy, csv, json, logging, math, os, threading, time
+import copy, csv, json, logging, math, os, re, threading, time
 
 try:
     import serial
@@ -24,8 +24,17 @@ DEFAULT_MAX_SEGMENTS = 100000
 DEFAULT_TRINKEY_BAUDRATE = 115200
 DEFAULT_TRINKEY_LOG_DIR = "~/printer_data/logs/vibration_tests"
 DEFAULT_TRINKEY_SYNC_COUNT = 20
-DEFAULT_TRINKEY_SYNC_TIMEOUT = 1.0
+DEFAULT_TRINKEY_ACK_TIMEOUT = 5.0
+DEFAULT_TRINKEY_IDLE_TIMEOUT = 6.0
+DEFAULT_TRINKEY_SYNC_TIMEOUT = 2.0
+TRINKEY_STOP_RETRY_INTERVAL = 0.500
 TRINKEY_SYNC_INTERVAL = 0.010
+
+TRINKEY_SAMPLE_RE = re.compile(
+    r'A,(base|toolhead),(\d+),(\d+),(-?\d+),(-?\d+),(-?\d+)')
+TRINKEY_SYNC_RE = re.compile(r'SYNC,(\d+),(\d+)')
+TRINKEY_ACK_START_RE = re.compile(r'ACK_START,[^,\r\n]*,(\d+)')
+TRINKEY_ACK_STOP_RE = re.compile(r'ACK_STOP,(\d+)')
 
 TRINKEY_SAMPLE_HEADER = (
     'chip_id', 'sample', 't_us', 'ax_raw', 'ay_raw', 'az_raw')
@@ -66,6 +75,7 @@ class TrinkeyLogger:
         self.started = False
         self.reader_error = None
         self.next_sync_seq = 1
+        self.ack_responses = {'start': [], 'stop': []}
         self.sync_responses = {}
         self.sync_condition = threading.Condition()
         self.file_lock = threading.Lock()
@@ -100,7 +110,7 @@ class TrinkeyLogger:
         return out[:96]
 
     def start(self, metadata):
-        """Open serial/files, start the reader thread, and send START.
+        """Open serial/files and put the Trinkey command protocol in idle.
 
         Args:
             metadata: JSON-serialisable dictionary describing the test point.
@@ -121,19 +131,43 @@ class TrinkeyLogger:
             self.reader_thread = threading.Thread(target=self._reader_loop)
             self.reader_thread.daemon = True
             self.reader_thread.start()
-            self._send_command("START,%s" % (self.run_id,))
-            self.started = True
-            self.write_event("start_sent")
+            self._synchronise_idle()
         except Exception:
             self.stop()
             raise
+
+    def start_streaming(self):
+        """Ask the Trinkey firmware to start streaming and wait for ACK_START."""
+        self._send_command("START,%s" % (self.run_id,))
+        self.started = True
+        self.write_event("start_sent")
+        self._wait_for_ack("start", DEFAULT_TRINKEY_ACK_TIMEOUT)
+
+    def stop_streaming(self):
+        """Ask the Trinkey firmware to stop streaming and wait for ACK_STOP."""
+        if self.serial_conn is None or not self.started:
+            return
+        deadline = self.reactor.monotonic() + DEFAULT_TRINKEY_ACK_TIMEOUT
+        first_attempt = True
+        while self.reactor.monotonic() < deadline:
+            self._send_command("STOP")
+            self.write_event("stop_sent" if first_attempt else "stop_retry")
+            first_attempt = False
+            response = self._wait_for_ack(
+                "stop", TRINKEY_STOP_RETRY_INTERVAL,
+                raise_on_timeout=False)
+            if response is not None:
+                self.started = False
+                self._pause(0.050)
+                return
+        raise self.printer.command_error(
+            "Timed out waiting for Trinkey ACK_STOP")
 
     def stop(self):
         """Stop firmware streaming, stop the reader thread, and close files."""
         if self.serial_conn is not None and self.started:
             try:
-                self._send_command("STOP")
-                self._pause(0.100)
+                self.stop_streaming()
             except Exception:
                 logging.exception("Failed to send Trinkey STOP")
 
@@ -225,6 +259,23 @@ class TrinkeyLogger:
         self.serial_conn.write(("%s\n" % (command,)).encode("ascii"))
         self.serial_conn.flush()
 
+    def _synchronise_idle(self):
+        """Flush partial firmware commands and confirm the device is idle."""
+        deadline = self.reactor.monotonic() + DEFAULT_TRINKEY_IDLE_TIMEOUT
+        while self.reactor.monotonic() < deadline:
+            self._send_command("")
+            self._pause(0.020)
+            self._send_command("STOP")
+            response = self._wait_for_ack("stop", 0.500, raise_on_timeout=False)
+            if response is not None:
+                trinkey_t_us, host_time = response
+                self.write_event("idle_ack_stop", host_time=host_time,
+                                 trinkey_t_us=trinkey_t_us)
+                self.started = False
+                return
+        raise self.printer.command_error(
+            "Timed out waiting for Trinkey STOP during startup")
+
     def _reader_loop(self):
         """Continuously read Trinkey serial rows and route them to CSV files."""
         try:
@@ -250,24 +301,62 @@ class TrinkeyLogger:
             line: Decoded line without newline characters.
             host_time: Klipper host monotonic time when the line was received.
         """
-        if line.startswith("A,"):
-            self._handle_sample_line(line)
-            return
-        if line.startswith("SYNC,"):
-            self._handle_sync_line(line, host_time)
-            return
-        if line.startswith("ACK_START,"):
-            self.write_event("ack_start", host_time=host_time,
-                             trinkey_t_us=self._last_csv_int(line))
-            return
-        if line.startswith("ACK_STOP,"):
-            self.write_event("ack_stop", host_time=host_time,
-                             trinkey_t_us=self._last_csv_int(line))
+        recovered = self._handle_recoverable_records(line, host_time)
+        if recovered:
+            if recovered > 1 or not self._line_starts_with_record(line):
+                self.write_event("serial_recovered", host_time=host_time,
+                                 line=line)
             return
         if line.startswith("ERR,"):
             self.write_event("firmware_error", host_time=host_time, line=line)
             return
+        if line.startswith("A,"):
+            self.write_event("bad_sample", host_time=host_time, line=line)
+            return
+        if line.startswith("SYNC,"):
+            self.write_event("bad_sync", host_time=host_time, line=line)
+            return
         self.write_event("raw", host_time=host_time, line=line)
+
+    def _line_starts_with_record(self, line):
+        """Return true when a line begins with a recoverable record."""
+        for pattern in (TRINKEY_SAMPLE_RE, TRINKEY_SYNC_RE,
+                        TRINKEY_ACK_START_RE, TRINKEY_ACK_STOP_RE):
+            match = pattern.match(line)
+            if match is not None and match.start() == 0:
+                return True
+        return False
+
+    def _handle_recoverable_records(self, line, host_time):
+        """Recover complete protocol records from a possibly damaged line."""
+        records = []
+        for match in TRINKEY_SAMPLE_RE.finditer(line):
+            records.append((match.start(), "sample", match))
+        for match in TRINKEY_SYNC_RE.finditer(line):
+            records.append((match.start(), "sync", match))
+        for match in TRINKEY_ACK_START_RE.finditer(line):
+            records.append((match.start(), "ack_start", match))
+        for match in TRINKEY_ACK_STOP_RE.finditer(line):
+            records.append((match.start(), "ack_stop", match))
+        records.sort(key=lambda item: item[0])
+
+        for _, kind, match in records:
+            if kind == "sample":
+                self._write_sample_fields(match.groups())
+            elif kind == "sync":
+                seq, trinkey_t_us = match.groups()
+                self._record_sync(int(seq), int(trinkey_t_us), host_time)
+            elif kind == "ack_start":
+                trinkey_t_us = int(match.group(1))
+                self._record_ack("start", trinkey_t_us, host_time)
+                self.write_event("ack_start", host_time=host_time,
+                                 trinkey_t_us=trinkey_t_us)
+            elif kind == "ack_stop":
+                trinkey_t_us = int(match.group(1))
+                self._record_ack("stop", trinkey_t_us, host_time)
+                self.write_event("ack_stop", host_time=host_time,
+                                 trinkey_t_us=trinkey_t_us)
+        return len(records)
 
     def _handle_sample_line(self, line):
         """Parse and store one tagged accelerometer sample row.
@@ -280,13 +369,17 @@ class TrinkeyLogger:
         if len(parts) != 7:
             self.write_event("bad_sample", line=line)
             return
+        self._write_sample_fields(parts[1:])
+
+    def _write_sample_fields(self, fields):
+        """Store one parsed A row in samples.csv."""
         row = {
-            'chip_id': parts[1],
-            'sample': parts[2],
-            't_us': parts[3],
-            'ax_raw': parts[4],
-            'ay_raw': parts[5],
-            'az_raw': parts[6],
+            'chip_id': fields[0],
+            'sample': fields[1],
+            't_us': fields[2],
+            'ax_raw': fields[3],
+            'ay_raw': fields[4],
+            'az_raw': fields[5],
         }
         with self.file_lock:
             self.sample_writer.writerow(row)
@@ -308,6 +401,10 @@ class TrinkeyLogger:
         except ValueError:
             self.write_event("bad_sync", host_time=host_time, line=line)
             return
+        self._record_sync(seq, trinkey_t_us, host_time)
+
+    def _record_sync(self, seq, trinkey_t_us, host_time):
+        """Record a firmware SYNC line for the sync waiting path."""
         with self.sync_condition:
             self.sync_responses[seq] = (trinkey_t_us, host_time)
             self.sync_condition.notify_all()
@@ -325,6 +422,30 @@ class TrinkeyLogger:
             return int(line.rsplit(',', 1)[1])
         except (IndexError, ValueError):
             return ""
+
+    def _record_ack(self, kind, trinkey_t_us, host_time):
+        """Record a firmware ACK line for the command waiting path."""
+        with self.sync_condition:
+            self.ack_responses[kind].append((trinkey_t_us, host_time))
+            self.sync_condition.notify_all()
+
+    def _wait_for_ack(self, kind, timeout, raise_on_timeout=True):
+        """Wait until the reader thread receives the requested ACK line."""
+        deadline = self.reactor.monotonic() + timeout
+        with self.sync_condition:
+            while not self.ack_responses[kind]:
+                if self.reader_error is not None:
+                    raise self.printer.command_error(
+                        "Trinkey reader failed: %s" % (self.reader_error,))
+                remaining = deadline - self.reactor.monotonic()
+                if remaining <= 0.:
+                    if not raise_on_timeout:
+                        return None
+                    raise self.printer.command_error(
+                        "Timed out waiting for Trinkey ACK_%s"
+                        % (kind.upper(),))
+                self.sync_condition.wait(remaining)
+            return self.ack_responses[kind].pop(0)
 
     def sync_many(self, phase, count):
         """Run several sync requests and write their timing records.
@@ -1035,6 +1156,8 @@ class VibrationTest:
                 "%d segments (%.0f/s), peak %.3f mm/s, %.3f mm/s^2"
                 % (axis, frequency, amplitude, duration, count, segment_rate,
                    max_v, max_a))
+            if trinkey_logger is not None:
+                trinkey_logger.start_streaming()
             input_segments, motion_start, motion_end = (
                 self._run_direct_sinusoid(
                     toolhead, axis_index, duration, frequency, amplitude,
@@ -1048,6 +1171,7 @@ class VibrationTest:
                 toolhead.wait_moves()
             if trinkey_logger is not None:
                 trinkey_logger.write_event("motion_wait_complete")
+                trinkey_logger.stop_streaming()
                 trinkey_logger.write_event("post_sync_start")
                 trinkey_logger.sync_many("post", sync_count)
                 trinkey_logger.write_input_segments(
