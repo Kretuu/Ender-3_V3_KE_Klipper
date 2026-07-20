@@ -4,26 +4,19 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import copy, csv, json, logging, math, os, re, threading, time
-
-try:
-    import serial
-except ImportError:
-    serial = None
+import serial
 
 
-AXIS_INDEX = {'X': 0, 'Y': 1, 'Z': 2}
+AXIS_INDEX = {'X': 0, 'Y': 1}
 
-DEFAULT_AMPLITUDE = 0.02
-DEFAULT_DURATION = 5.0
-DEFAULT_FREQUENCY = 40.0
-DEFAULT_SEGMENTS_PER_CYCLE = 32
-DEFAULT_MAX_SEGMENT_RATE = 6000.0
-DEFAULT_CHUNK_TIME = 0.250
-DEFAULT_RAMP_CYCLES = 2.0
-DEFAULT_MAX_SEGMENTS = 100000
+SEGMENTS_PER_CYCLE = 32
+MAX_SEGMENT_RATE = 6000.0
+CHUNK_TIME = 0.250
+MAX_VELOCITY = 500.0
+MAX_ACCEL = 7500.0
+SYNC_COUNT = 20
 DEFAULT_TRINKEY_BAUDRATE = 115200
 DEFAULT_TRINKEY_LOG_DIR = "~/printer_data/logs/vibration_tests"
-DEFAULT_TRINKEY_SYNC_COUNT = 20
 DEFAULT_TRINKEY_CONTROL_TIMEOUT = 5.0
 DEFAULT_TRINKEY_IDLE_TIMEOUT = 6.0
 DEFAULT_TRINKEY_SYNC_TIMEOUT = 2.0
@@ -132,10 +125,6 @@ class TrinkeyLogger:
         Args:
             metadata: JSON-serialisable dictionary describing the test point.
         """
-        if serial is None:
-            raise self.printer.command_error(
-                "TRINKEY=1 requires the pyserial Python package")
-
         os.makedirs(self.run_dir)
         try:
             self._open_files()
@@ -812,56 +801,29 @@ class VibrationTest:
         self.printer = config.get_printer()
         self.gcode = self.printer.lookup_object('gcode')
         self.reactor = self.printer.get_reactor()
-        self.trinkey_enabled = config.getboolean('trinkey', False)
-        self.trinkey_port = config.get('trinkey_port', None)
+        self.trinkey_port = config.get('trinkey_port')
         self.trinkey_log_dir = config.get(
             'trinkey_log_dir', DEFAULT_TRINKEY_LOG_DIR)
-        self.trinkey_sync_count = config.getint(
-            'trinkey_sync_count', DEFAULT_TRINKEY_SYNC_COUNT, minval=0,
-            maxval=200)
         self.gcode.register_command(
             "RUN_VIBRATION_TEST", self.cmd_RUN_VIBRATION_TEST,
             desc=self.cmd_RUN_VIBRATION_TEST_help)
 
-    def _default_run_id(self, axis, frequency):
-        """Build a simple timestamped run identifier for Trinkey logging.
-
-        Args:
-            axis: Commanded printer axis.
-            frequency: Test frequency in Hz.
-
-        Returns:
-            Directory-safe run identifier.
-        """
-        timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        return "%s_%s_%.3fhz" % (timestamp, axis.lower(), frequency)
-
-    def _create_trinkey_logger(self, gcmd, axis, frequency):
+    def _create_trinkey_logger(self, gcmd):
         """Create the Trinkey logger requested by a RUN_VIBRATION_TEST command.
 
         Args:
             gcmd: Klipper G-code command wrapper.
-            axis: Commanded printer axis.
-            frequency: Test frequency in Hz.
 
         Returns:
-            Tuple of TrinkeyLogger and sync count.
+            Logger for the configured Trinkey and output directory.
         """
-        port = gcmd.get('TRINKEY_PORT', self.trinkey_port)
-        if not port:
-            raise gcmd.error(
-                "TRINKEY=1 requires TRINKEY_PORT=<usb serial path> or "
-                "trinkey_port in [vibration_test]")
-        log_dir = gcmd.get('LOG_DIR', self.trinkey_log_dir)
-        run_id = gcmd.get('RUN_ID', self._default_run_id(axis, frequency))
-        sync_count = gcmd.get_int(
-            'SYNC_COUNT', self.trinkey_sync_count, minval=0, maxval=200)
-        return TrinkeyLogger(self.printer, port, log_dir, run_id), sync_count
+        run_id = gcmd.get('RUN_ID')
+        return TrinkeyLogger(
+            self.printer, self.trinkey_port, self.trinkey_log_dir, run_id)
 
     def _build_trinkey_metadata(
             self, axis, axis_index, duration, frequency, amplitude, ramp_time,
-            segment_time, segments_per_cycle, max_segment_rate, chunk_time,
-            max_segments, max_v, max_a):
+            segment_time, max_v, max_a):
         """Build JSON metadata written beside the Trinkey CSV files.
 
         Args:
@@ -872,10 +834,6 @@ class VibrationTest:
             amplitude: Commanded displacement amplitude in mm.
             ramp_time: Ramp-in/ramp-out duration in seconds.
             segment_time: Duration of each generated trapq segment in seconds.
-            segments_per_cycle: Requested segment resolution per sine cycle.
-            max_segment_rate: User limit for generated segments per second.
-            chunk_time: Host-side trapq flush chunk duration.
-            max_segments: User limit for total generated segments.
             max_v: Maximum commanded velocity in mm/s.
             max_a: Maximum commanded acceleration in mm/s^2.
 
@@ -891,10 +849,9 @@ class VibrationTest:
             'amplitude_mm': amplitude,
             'ramp_time_s': ramp_time,
             'segment_time_s': segment_time,
-            'segments_per_cycle': segments_per_cycle,
-            'max_segment_rate': max_segment_rate,
-            'chunk_time_s': chunk_time,
-            'max_segments': max_segments,
+            'segments_per_cycle': SEGMENTS_PER_CYCLE,
+            'max_segment_rate': MAX_SEGMENT_RATE,
+            'chunk_time_s': CHUNK_TIME,
             'peak_velocity_mm_s': max_v,
             'peak_accel_mm_s2': max_a,
             'sample_units': {
@@ -913,31 +870,12 @@ class VibrationTest:
         Returns:
             Tuple of axis name and numeric axis index.
         """
-        axis = gcmd.get('AXIS', default='X').upper()
+        axis = gcmd.get('AXIS').upper()
         if axis not in AXIS_INDEX:
             raise gcmd.error(
                 '{"code":"key274", "msg": "Invalid axis: %s", '
                 '"values": ["%s"]}' % (axis, axis))
         return axis, AXIS_INDEX[axis]
-
-    def _get_ramp_time(self, gcmd, duration, frequency):
-        """Determine the ramp-in/ramp-out duration for the sinusoid.
-
-        Args:
-            gcmd: Klipper G-code command wrapper.
-            duration: Total test duration in seconds.
-            frequency: Sinusoid frequency in Hz.
-
-        Returns:
-            Ramp duration in seconds.
-        """
-        ramp_time = gcmd.get_float('RAMP_TIME', None, minval=0.,
-                                   maxval=duration * 0.5)
-        if ramp_time is not None:
-            return ramp_time
-        ramp_cycles = gcmd.get_float('RAMP_CYCLES', DEFAULT_RAMP_CYCLES,
-                                     minval=0.)
-        return min(duration * 0.25, ramp_cycles / frequency)
 
     def _envelope(self, t, duration, ramp_time):
         """Calculate the smooth amplitude envelope at time t.
@@ -950,8 +888,6 @@ class VibrationTest:
         Returns:
             Envelope multiplier between 0 and 1.
         """
-        if ramp_time <= 0.:
-            return 1.
         if t < ramp_time:
             u = t / ramp_time
         elif t > duration - ramp_time:
@@ -1087,14 +1023,8 @@ class VibrationTest:
         finally:
             self._restore_kinematics_state(kin, saved_kin_state)
 
-        max_velocity = gcmd.get_float(
-            'MAX_VELOCITY', toolhead_info['max_velocity'], above=0.)
-        max_accel = gcmd.get_float(
-            'MAX_ACCEL', toolhead_info['max_accel'], above=0.)
-        if axis_index == 2:
-            max_velocity = min(max_velocity,
-                               getattr(kin, 'max_z_velocity', max_velocity))
-            max_accel = min(max_accel, getattr(kin, 'max_z_accel', max_accel))
+        max_velocity = MAX_VELOCITY
+        max_accel = MAX_ACCEL
         if max_v > max_velocity * 1.000001:
             raise gcmd.error(
                 "Requested vibration requires %.3f mm/s, limit is %.3f mm/s"
@@ -1242,14 +1172,9 @@ class VibrationTest:
         return input_segments, start_print_time, print_time
 
     cmd_RUN_VIBRATION_TEST_help = (
-        "Run streamed sinusoidal motion. Params: AXIS=<X|Y|Z> "
-        "DURATION=<0.1..10s> FREQUENCY=<Hz> AMPLITUDE=<mm> "
-        "SEGMENTS_PER_CYCLE=<8..200> MAX_SEGMENT_RATE=<segments/s> "
-        "CHUNK_TIME=<0.05..1s> MAX_SEGMENTS=<count> RAMP_TIME=<s> "
-        "RAMP_CYCLES=<cycles> MAX_VELOCITY=<mm/s> "
-        "MAX_ACCEL=<mm/s^2> INPUT_SHAPING=<0|1> WAIT=<0|1> "
-        "TRINKEY=<0|1> TRINKEY_PORT=<path> LOG_DIR=<path> RUN_ID=<id> "
-        "SYNC_COUNT=<count>")
+        "Run one logged sinusoidal test point. Params: AXIS=<X|Y> "
+        "DURATION=<0.1..8s> FREQUENCY=<1..100Hz> AMPLITUDE=<mm> "
+        "RAMP_TIME=<s> RUN_ID=<id>")
 
     def cmd_RUN_VIBRATION_TEST(self, gcmd):
         """Execute the RUN_VIBRATION_TEST G-code command.
@@ -1258,101 +1183,65 @@ class VibrationTest:
             gcmd: Klipper G-code command wrapper.
         """
         axis, axis_index = self._get_axis(gcmd)
-        duration = gcmd.get_float('DURATION', DEFAULT_DURATION,
-                                  minval=0.100, maxval=10.)
-        frequency = gcmd.get_float('FREQUENCY', DEFAULT_FREQUENCY,
-                                   above=0., maxval=1000.)
-        amplitude = gcmd.get_float('AMPLITUDE', DEFAULT_AMPLITUDE, above=0.)
-        segments_per_cycle = gcmd.get_int(
-            'SEGMENTS_PER_CYCLE', DEFAULT_SEGMENTS_PER_CYCLE,
-            minval=8, maxval=200)
-        max_segment_rate = gcmd.get_float(
-            'MAX_SEGMENT_RATE', DEFAULT_MAX_SEGMENT_RATE,
-            above=0., maxval=20000.)
-        chunk_time = gcmd.get_float('CHUNK_TIME', DEFAULT_CHUNK_TIME,
-                                    minval=0.050, maxval=1.000)
-        max_segments = gcmd.get_int('MAX_SEGMENTS', DEFAULT_MAX_SEGMENTS,
-                                    minval=1)
-        wait = gcmd.get_int('WAIT', 1, minval=0, maxval=1)
-        trinkey_enabled = gcmd.get_int(
-            'TRINKEY', int(self.trinkey_enabled), minval=0, maxval=1)
-        if trinkey_enabled and not wait:
-            raise gcmd.error("TRINKEY=1 requires WAIT=1 so the log covers "
-                             "the complete motion")
-
-        segment_rate = frequency * segments_per_cycle
+        duration = gcmd.get_float('DURATION', minval=0.100, maxval=8.)
+        frequency = gcmd.get_float('FREQUENCY', minval=1., maxval=100.)
+        amplitude = gcmd.get_float('AMPLITUDE', above=0.)
+        segment_rate = frequency * SEGMENTS_PER_CYCLE
         segment_time = 1. / segment_rate
-        if segment_rate > max_segment_rate:
+        if segment_rate > MAX_SEGMENT_RATE:
             raise gcmd.error(
                 "Requested segment rate %.0f/s exceeds MAX_SEGMENT_RATE %.0f/s"
-                % (segment_rate, max_segment_rate))
-        ramp_time = self._get_ramp_time(gcmd, duration, frequency)
-        if ramp_time <= 0. and abs(duration * frequency
-                                  - round(duration * frequency)) > 0.000001:
-            raise gcmd.error(
-                "RAMP_TIME=0 requires DURATION*FREQUENCY to be an integer")
+                % (segment_rate, MAX_SEGMENT_RATE))
+        ramp_time = gcmd.get_float('RAMP_TIME', above=0.,
+                                   maxval=duration * 0.5)
 
         count, min_x, max_x, max_v, max_a = self._scan_segments(
             duration, frequency, amplitude, ramp_time, segment_time)
-        if count > max_segments:
-            raise gcmd.error(
-                "Vibration test would generate %d segments, limit is %d"
-                % (count, max_segments))
-
         toolhead = self.printer.lookup_object('toolhead')
         start_pos = toolhead.get_position()
         self._check_motion_limits(gcmd, toolhead, axis_index, start_pos,
                                   min_x, max_x, max_v, max_a)
 
         input_shaper = self.printer.lookup_object('input_shaper', None)
-        if input_shaper is not None and not gcmd.get_int('INPUT_SHAPING', 0):
+        if input_shaper is not None:
             input_shaper.disable_shaping()
             gcmd.respond_info("Disabled [input_shaper] for vibration test")
-        else:
-            input_shaper = None
 
         trinkey_logger = None
         try:
-            if trinkey_enabled:
-                trinkey_logger, sync_count = self._create_trinkey_logger(
-                    gcmd, axis, frequency)
-                trinkey_metadata = self._build_trinkey_metadata(
-                    axis, axis_index, duration, frequency, amplitude,
-                    ramp_time, segment_time, segments_per_cycle,
-                    max_segment_rate, chunk_time, max_segments, max_v, max_a)
-                trinkey_logger.start(trinkey_metadata)
-                trinkey_logger.write_event("pre_sync_start")
-                trinkey_logger.sync_many("pre", sync_count)
+            trinkey_logger = self._create_trinkey_logger(gcmd)
+            trinkey_metadata = self._build_trinkey_metadata(
+                axis, axis_index, duration, frequency, amplitude,
+                ramp_time, segment_time, max_v, max_a)
+            trinkey_logger.start(trinkey_metadata)
+            trinkey_logger.write_event("pre_sync_start")
+            trinkey_logger.sync_many("pre", SYNC_COUNT)
 
             gcmd.respond_info(
                 "Vibration test %s: %.3f Hz, %.6f mm, %.3f s, "
                 "%d segments (%.0f/s), peak %.3f mm/s, %.3f mm/s^2"
                 % (axis, frequency, amplitude, duration, count, segment_rate,
                    max_v, max_a))
-            if trinkey_logger is not None:
-                trinkey_logger.start_capture(axis)
+            trinkey_logger.start_capture(axis)
             input_segments, motion_start, motion_end = (
                 self._run_direct_sinusoid(
                     toolhead, axis_index, duration, frequency, amplitude,
-                    ramp_time, segment_time, chunk_time))
-            if trinkey_logger is not None:
-                trinkey_logger.write_event("motion_queued",
-                                           print_time=motion_start)
-                trinkey_logger.write_event("motion_queue_end",
-                                           print_time=motion_end)
-            if wait:
-                toolhead.wait_moves()
-            if trinkey_logger is not None:
-                trinkey_logger.write_event("motion_wait_complete")
-                trinkey_logger.stop_capture()
-                trinkey_logger.write_event("post_sync_start")
-                trinkey_logger.sync_many("post", sync_count)
-                trinkey_logger.write_input_segments(
-                    axis, axis_index, frequency, input_segments)
-                trinkey_logger.dump_samples()
-                gcmd.respond_info(
-                    "Trinkey vibration log written to %s"
-                    % (trinkey_logger.run_dir,))
+                    ramp_time, segment_time, CHUNK_TIME))
+            trinkey_logger.write_event("motion_queued",
+                                       print_time=motion_start)
+            trinkey_logger.write_event("motion_queue_end",
+                                       print_time=motion_end)
+            toolhead.wait_moves()
+            trinkey_logger.write_event("motion_wait_complete")
+            trinkey_logger.stop_capture()
+            trinkey_logger.write_event("post_sync_start")
+            trinkey_logger.sync_many("post", SYNC_COUNT)
+            trinkey_logger.write_input_segments(
+                axis, axis_index, frequency, input_segments)
+            trinkey_logger.dump_samples()
+            gcmd.respond_info(
+                "Trinkey vibration log written to %s"
+                % (trinkey_logger.run_dir,))
         finally:
             if trinkey_logger is not None:
                 trinkey_logger.stop()
