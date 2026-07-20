@@ -27,13 +27,16 @@ DEFAULT_TRINKEY_SYNC_COUNT = 20
 DEFAULT_TRINKEY_CONTROL_TIMEOUT = 5.0
 DEFAULT_TRINKEY_IDLE_TIMEOUT = 6.0
 DEFAULT_TRINKEY_SYNC_TIMEOUT = 2.0
-DEFAULT_TRINKEY_DUMP_TIMEOUT = 30.0
+DEFAULT_TRINKEY_DUMP_TIMEOUT = 90.0
 TRINKEY_CONTROL_RETRY_INTERVAL = 0.500
 TRINKEY_SYNC_INTERVAL = 0.010
+TRINKEY_SERIAL_BUFFER_LIMIT = 65536
 
 TRINKEY_SAMPLE_RE = re.compile(
     r'A,(base|toolhead),(\d+),(\d+),(-?\d+),(-?\d+),(-?\d+)')
 TRINKEY_SYNC_RE = re.compile(r'SYNC,(\d+),(\d+)')
+TRINKEY_READ_ERROR_RE = re.compile(
+    r'ERR,READ_ACCEL,(base|toolhead),(\d+),(\d+)')
 TRINKEY_ACK_START_RE = re.compile(
     r'ACK_START,([^,\r\n]*),(base|toolhead|both),(\d+)')
 TRINKEY_ACK_STOP_RE = re.compile(
@@ -90,6 +93,8 @@ class TrinkeyLogger:
         self.ack_stop_line = None
         self.dump_begin_line = None
         self.dump_end_line = None
+        self.dump_record_ids = {'base': set(), 'toolhead': set()}
+        self.dump_duplicate_records = 0
         self.file_lock = threading.Lock()
 
         self.sample_file = None
@@ -332,6 +337,8 @@ class TrinkeyLogger:
 
     def dump_samples(self):
         """Request the buffered samples and wait until DUMP_END is received."""
+        self.dump_record_ids = {'base': set(), 'toolhead': set()}
+        self.dump_duplicate_records = 0
         with self.control_condition:
             self.dump_begin_line = None
             self.dump_end_line = None
@@ -345,6 +352,43 @@ class TrinkeyLogger:
         with self.file_lock:
             self.sample_file.flush()
             self.event_file.flush()
+        self._validate_dump()
+
+    def _record_dump_index(self, chip_id, sample):
+        """Record one sample attempt received during the current dump."""
+        records = self.dump_record_ids[chip_id]
+        if sample in records:
+            self.dump_duplicate_records += 1
+        records.add(sample)
+
+    def _validate_dump(self):
+        """Reject a dump with missing, unexpected, or duplicate records."""
+        match = TRINKEY_DUMP_RE.fullmatch(self.dump_end_line or "")
+        if match is None:
+            raise self.printer.command_error(
+                "Invalid Trinkey DUMP_END record")
+
+        stored_count = int(match.group(3))
+        mode = match.group(9)
+        chips = ('base', 'toolhead') if mode == 'both' else (mode,)
+        expected = set(range(stored_count))
+        problems = []
+        for chip_id in chips:
+            received = self.dump_record_ids[chip_id]
+            missing = len(expected - received)
+            unexpected = len(received - expected)
+            if missing or unexpected:
+                problems.append(
+                    "%s missing=%d unexpected=%d"
+                    % (chip_id, missing, unexpected))
+        if self.dump_duplicate_records:
+            problems.append(
+                "duplicates=%d" % (self.dump_duplicate_records,))
+        if problems:
+            detail = "; ".join(problems)
+            self.write_event("dump_incomplete", line=detail)
+            raise self.printer.command_error(
+                "Incomplete Trinkey dump: %s" % (detail,))
 
     def _wait_for_control(
             self, predicate, timeout, error_message, raise_on_timeout=True):
@@ -375,17 +419,30 @@ class TrinkeyLogger:
             return True
 
     def _reader_loop(self):
-        """Continuously read Trinkey serial rows and route them to CSV files."""
+        """Read arbitrary serial chunks and route complete protocol rows."""
+        pending = bytearray()
         try:
             while self.running:
-                raw_line = self.serial_conn.readline()
-                if not raw_line:
+                available = self.serial_conn.in_waiting
+                chunk = self.serial_conn.read(available or 1)
+                if not chunk:
                     continue
-                line = raw_line.decode("utf-8", "replace").strip()
-                if not line:
-                    continue
-                host_time = self.reactor.monotonic()
-                self._handle_serial_line(line, host_time)
+                pending.extend(chunk)
+                while True:
+                    newline = pending.find(b'\n')
+                    if newline < 0:
+                        break
+                    raw_line = bytes(pending[:newline])
+                    del pending[:newline + 1]
+                    line = raw_line.rstrip(b'\r').decode(
+                        "utf-8", "replace")
+                    if line:
+                        self._handle_serial_line(
+                            line, self.reactor.monotonic())
+                if len(pending) > TRINKEY_SERIAL_BUFFER_LIMIT:
+                    raise IOError(
+                        "Trinkey serial record exceeded %d bytes"
+                        % (TRINKEY_SERIAL_BUFFER_LIMIT,))
         except Exception as e:
             self.reader_error = e
             logging.exception("Trinkey reader thread failed")
@@ -421,6 +478,7 @@ class TrinkeyLogger:
     def _line_is_single_record(self, line):
         """Return true when a line is exactly one valid protocol record."""
         for pattern in (TRINKEY_SAMPLE_RE, TRINKEY_SYNC_RE,
+                        TRINKEY_READ_ERROR_RE,
                         TRINKEY_ACK_START_RE, TRINKEY_ACK_STOP_RE,
                         TRINKEY_DUMP_RE):
             if pattern.fullmatch(line) is not None:
@@ -434,6 +492,8 @@ class TrinkeyLogger:
             records.append((match.start(), "sample", match))
         for match in TRINKEY_SYNC_RE.finditer(line):
             records.append((match.start(), "sync", match))
+        for match in TRINKEY_READ_ERROR_RE.finditer(line):
+            records.append((match.start(), "read_error", match))
         for match in TRINKEY_ACK_START_RE.finditer(line):
             records.append((match.start(), "ack_start", match))
         for match in TRINKEY_ACK_STOP_RE.finditer(line):
@@ -448,6 +508,12 @@ class TrinkeyLogger:
             elif kind == "sync":
                 seq, trinkey_t_us = match.groups()
                 self._record_sync(int(seq), int(trinkey_t_us), host_time)
+            elif kind == "read_error":
+                chip_id, sample, trinkey_t_us = match.groups()
+                self._record_dump_index(chip_id, int(sample))
+                self.write_event(
+                    "firmware_error", host_time=host_time,
+                    trinkey_t_us=int(trinkey_t_us), line=match.group(0))
             elif kind == "ack_start":
                 self._record_ack_start(
                     match.group(0), int(match.group(3)), host_time)
@@ -521,6 +587,7 @@ class TrinkeyLogger:
 
     def _write_sample_fields(self, fields):
         """Store one parsed A row in samples.csv."""
+        self._record_dump_index(fields[0], int(fields[1]))
         row = {
             'chip_id': fields[0],
             'sample': fields[1],
