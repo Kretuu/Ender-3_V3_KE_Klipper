@@ -257,6 +257,7 @@ class ToolHead:
         self.trapq_append = ffi_lib.trapq_append
         self.trapq_finalize_moves = ffi_lib.trapq_finalize_moves
         self.step_generators = []
+        self.motion_prepare_callbacks = []
         # Create kinematics class
         gcode = self.printer.lookup_object('gcode')
         self.Coord = gcode.Coord
@@ -349,6 +350,10 @@ class ToolHead:
                               + move.cruise_t + move.decel_t)
             for cb in move.timing_callbacks:
                 cb(next_move_time)
+        # Give preview-based controllers access to the completed trapq before
+        # any of its positions are converted to step times.
+        for cb in self.motion_prepare_callbacks:
+            cb(self.print_time, next_move_time, False)
         # Generate steps for moves
         if self.special_queuing_state:
             self._update_drip_move_time(next_move_time)
@@ -362,6 +367,10 @@ class ToolHead:
         self.reactor.update_timer(self.flush_timer, self.reactor.NEVER)
         self.move_queue.set_flush_time(self.buffer_time_high)
         self.idle_flush_print_time = 0.
+        # A final preparation pass lets preview-based controllers pad the end
+        # of the trajectory with its terminal position.
+        for cb in self.motion_prepare_callbacks:
+            cb(self.print_time, self.last_kin_move_time, True)
         flush_time = self.last_kin_move_time + self.kin_flush_delay
         flush_time = max(flush_time, self.print_time - self.kin_flush_delay)
         self.last_kin_flush_time = max(self.last_kin_flush_time, flush_time)
@@ -557,6 +566,8 @@ class ToolHead:
         return self.trapq
     def register_step_generator(self, handler):
         self.step_generators.append(handler)
+    def register_motion_prepare_callback(self, callback):
+        self.motion_prepare_callbacks.append(callback)
     def note_step_generation_scan_time(self, delay, old_delay=0.):
         self.flush_step_generation()
         cur_delay = self.kin_flush_delay

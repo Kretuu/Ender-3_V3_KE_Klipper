@@ -21,7 +21,7 @@ SOURCE_FILES = [
     'pollreactor.c', 'msgblock.c', 'trdispatch.c',
     'kin_cartesian.c', 'kin_corexy.c', 'kin_corexz.c', 'kin_delta.c',
     'kin_deltesian.c', 'kin_polar.c', 'kin_rotary_delta.c', 'kin_winch.c',
-    'kin_extruder.c', 'kin_shaper.c',
+    'kin_extruder.c', 'kin_shaper.c', 'kin_filtered_bspline.c',
 ]
 DEST_LIB = "c_helper.so"
 OTHER_FILES = [
@@ -153,6 +153,27 @@ defs_kin_shaper = """
     struct stepper_kinematics * input_shaper_alloc(void);
 """
 
+defs_kin_filtered_bspline = """
+    struct fbf_controller *filtered_bspline_controller_alloc(void);
+    void filtered_bspline_controller_free(struct fbf_controller *controller);
+    void filtered_bspline_controller_reset(struct fbf_controller *controller);
+    int filtered_bspline_configure_axis(struct fbf_controller *controller
+        , char axis, int numerator_count, double numerator[]
+        , int denominator_count, double denominator[]);
+    int filtered_bspline_set_axis_limits(struct fbf_controller *controller
+        , char axis, double position_min, double position_max);
+    void filtered_bspline_set_enabled(struct fbf_controller *controller
+        , int enabled);
+    int filtered_bspline_prepare(struct fbf_controller *controller
+        , struct trapq *tq, double start_time, double end_time, int is_final);
+    int filtered_bspline_get_position(struct fbf_controller *controller
+        , char axis, double print_time, double *position);
+    struct stepper_kinematics *filtered_bspline_stepper_alloc(
+        struct fbf_controller *controller);
+    int filtered_bspline_stepper_set_sk(struct stepper_kinematics *sk
+        , struct stepper_kinematics *orig_sk);
+"""
+
 defs_serialqueue = """
     #define MESSAGE_MAX 64
     struct pull_queue_message {
@@ -211,7 +232,7 @@ defs_all = [
     defs_itersolve, defs_trapq, defs_trdispatch,
     defs_kin_cartesian, defs_kin_corexy, defs_kin_corexz, defs_kin_delta,
     defs_kin_deltesian, defs_kin_polar, defs_kin_rotary_delta, defs_kin_winch,
-    defs_kin_extruder, defs_kin_shaper,
+    defs_kin_extruder, defs_kin_shaper, defs_kin_filtered_bspline,
 ]
 
 # Update filenames to an absolute path
