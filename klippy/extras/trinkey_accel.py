@@ -1,0 +1,800 @@
+# Continuous Trinkey/BNO055 accelerometer streaming
+#
+# Copyright (C) 2026 Jakub Kreczetowski <kret1315@gmail.com>
+#
+# This file may be distributed under the terms of the GNU GPLv3 license.
+import collections, logging, re, struct, threading, time, zlib
+
+import serial
+
+from . import motion_report
+
+
+STREAM_MAGIC = 0x32534b54  # little-endian bytes: TKS2
+STREAM_FRAME_DATA = 1
+STREAM_FRAME_SYNC = 2
+STREAM_FRAME_STOP = 3
+STREAM_FRAME_STATUS = 4
+STREAM_PROTOCOL_VERSION = 2
+
+STREAM_DATA_HEADER = struct.Struct('<IHBBIIIIIII')
+STREAM_SAMPLE = struct.Struct('<IQhhhQhhhB')
+STREAM_SYNC = struct.Struct('<IQ')
+STREAM_STATUS = struct.Struct('<IIBIIIIIII')
+
+FLAG_BASE_VALID = 0x01
+FLAG_TOOLHEAD_VALID = 0x02
+FLAG_BASE_ERROR = 0x04
+FLAG_TOOLHEAD_ERROR = 0x08
+
+ACK_STOP_RE = re.compile(r'ACK_STOP,(\d+),(\d+),(\d+),(\d+),(\d+)')
+ACK_STREAM_START_RE = re.compile(
+    r'ACK_STREAM_START,([^,\r\n]*),(base|toolhead|both),(\d+),(\d+),'
+    r'(\d+),(\d+)')
+SYNC_RE = re.compile(r'SYNC,(\d+),(\d+)')
+ACK_BW_RE = re.compile(r'ACK_BW,(\d+),(\d+)')
+
+SERIAL_BAUD = 115200
+CONTROL_TIMEOUT = 5.0
+SYNC_TIMEOUT = 2.0
+CONTROL_RETRY_INTERVAL = 0.500
+SERIAL_RECORD_LIMIT = 65536
+DEFAULT_API_UPDATE_INTERVAL = 0.100
+DEFAULT_SYNC_INTERVAL = 1.0
+DEFAULT_INITIAL_SYNC_SAMPLES = 12
+DEFAULT_RAW_SCALE = 10.0  # BNO055 default m/s^2 units: 100 LSB/(m/s^2)
+SYNC_RTT_TOLERANCE = 0.001  # Experiment-specific USB RTT margin, seconds.
+
+
+def _cobs_decode(data):
+    """Decode one COBS frame without its trailing zero delimiter."""
+    output = bytearray()
+    index = 0
+    while index < len(data):
+        code = data[index]
+        if code == 0:
+            raise ValueError("zero byte inside COBS frame")
+        index += 1
+        end = index + code - 1
+        if end > len(data):
+            raise ValueError("truncated COBS frame")
+        output.extend(data[index:end])
+        index = end
+        if code != 0xff and index < len(data):
+            output.append(0)
+    return bytes(output)
+
+
+class TrinkeyClockMapper:
+    """Fit Trinkey microseconds directly to primary-MCU print time."""
+    def __init__(self, max_points=64):
+        self.points = collections.deque(maxlen=max_points)
+        self.slope = 1.0
+        self.offset = 0.0
+        self.last_rtt = 0.0
+        self.last_device_time_us = 0
+        self.last_print_time = 0.0
+        self.accepted_points = 0
+        self.rtt_minimum = 0.0
+        self.rtt_limit = 0.0
+        self.ready = False
+
+    def reset(self):
+        self.points.clear()
+        self.slope = 1.0
+        self.offset = 0.0
+        self.last_rtt = 0.0
+        self.last_device_time_us = 0
+        self.last_print_time = 0.0
+        self.accepted_points = 0
+        self.rtt_minimum = 0.0
+        self.rtt_limit = 0.0
+        self.ready = False
+
+    def add(self, device_time_us, print_time, rtt):
+        device_time = float(device_time_us) * 1.e-6
+        self.points.append((device_time, float(print_time), float(rtt)))
+        self.last_rtt = float(rtt)
+        self.last_device_time_us = int(device_time_us)
+        self.last_print_time = float(print_time)
+        self._fit()
+
+    def _fit(self):
+        if not self.points:
+            return
+        self.rtt_minimum = min(p[2] for p in self.points)
+        self.rtt_limit = self.rtt_minimum + SYNC_RTT_TOLERANCE
+        points = [p for p in self.points if p[2] <= self.rtt_limit]
+        self.accepted_points = len(points)
+
+        # Until the clock observations span several seconds, estimating only
+        # the offset is substantially less sensitive to USB RTT jitter.
+        offset = sum(p[1] - p[0] for p in points) / len(points)
+        slope = 1.0
+        if len(points) >= 8 and points[-1][0] - points[0][0] >= 5.0:
+            mean_x = sum(p[0] for p in points) / len(points)
+            mean_y = sum(p[1] for p in points) / len(points)
+            variance = sum((p[0] - mean_x) ** 2 for p in points)
+            if variance > 0.:
+                candidate = sum(
+                    (p[0] - mean_x) * (p[1] - mean_y)
+                    for p in points) / variance
+                if 0.995 <= candidate <= 1.005:
+                    slope = candidate
+                    offset = mean_y - slope * mean_x
+        self.slope = slope
+        self.offset = offset
+        self.ready = True
+
+    def get_print_time(self, device_time_us):
+        return self.offset + self.slope * (float(device_time_us) * 1.e-6)
+
+    def get_status(self):
+        return {
+            'ready': self.ready,
+            'points': len(self.points),
+            'accepted_points': self.accepted_points,
+            'rtt_minimum': self.rtt_minimum,
+            'rtt_limit': self.rtt_limit,
+            'rtt_tolerance': SYNC_RTT_TOLERANCE,
+            'slope': self.slope,
+            'offset': self.offset,
+            'last_rtt': self.last_rtt,
+            'last_device_time_us': self.last_device_time_us,
+            'last_print_time': self.last_print_time,
+        }
+
+
+class TrinkeySensorDump:
+    def __init__(self, parent, sensor, update_interval):
+        self.parent = parent
+        self.sensor = sensor
+        self.api_dump = motion_report.APIDumpHelper(
+            parent.printer, self._api_update, self._api_startstop,
+            update_interval)
+        webhooks = parent.printer.lookup_object('webhooks')
+        webhooks.register_mux_endpoint(
+            'trinkey_accel/dump_trinkey_accel', 'sensor', sensor,
+            self._handle_dump)
+
+    def _api_startstop(self, is_start):
+        if is_start:
+            self.parent.add_stream_client()
+        else:
+            self.parent.remove_stream_client()
+
+    def _api_update(self, eventtime):
+        return self.parent.api_update(self.sensor, eventtime)
+
+    def _handle_dump(self, web_request):
+        self.api_dump.add_client(web_request)
+        header = (
+            'time', 'device_time_us', 'sample_sequence',
+            'x_raw', 'y_raw', 'z_raw',
+            'x_acceleration', 'y_acceleration', 'z_acceleration', 'flags')
+        web_request.send({'header': header})
+
+    def start_internal_client(self):
+        return self.api_dump.add_internal_client()
+
+
+class TrinkeyAccel:
+    def __init__(self, config):
+        self.printer = config.get_printer()
+        self.reactor = self.printer.get_reactor()
+        self.mcu = self.printer.lookup_object('mcu')
+        self.port = config.get('serial')
+        self.rate = config.getint('rate', 400, minval=100, maxval=1000)
+        if 1000000 % self.rate:
+            raise config.error(
+                "[trinkey_accel] rate must divide 1000000 exactly")
+        self.batch_size = config.getint(
+            'batch_size', 4, minval=1, maxval=16)
+        self.bandwidth = config.getint('bandwidth', 125)
+        if self.bandwidth not in (8, 16, 31, 63, 125, 250, 500, 1000):
+            raise config.error(
+                "[trinkey_accel] bandwidth must be one of "
+                "8, 16, 31, 63, 125, 250, 500, or 1000 Hz")
+        sensors = config.getlist(
+            'sensors', ('base', 'toolhead'))
+        self.sensors = tuple(s.strip().lower() for s in sensors)
+        if (not self.sensors
+                or any(s not in ('base', 'toolhead') for s in self.sensors)
+                or len(set(self.sensors)) != len(self.sensors)):
+            raise config.error(
+                "[trinkey_accel] sensors must contain base and/or toolhead")
+        self.mode = ('both' if len(self.sensors) == 2
+                     else self.sensors[0])
+        self.raw_scale = config.getfloat(
+            'raw_lsb_mm_s2', DEFAULT_RAW_SCALE, above=0.)
+        self.sync_interval = config.getfloat(
+            'sync_interval', DEFAULT_SYNC_INTERVAL, above=0.1)
+        self.initial_sync_samples = config.getint(
+            'initial_sync_samples', DEFAULT_INITIAL_SYNC_SAMPLES,
+            minval=2, maxval=50)
+        api_update_interval = config.getfloat(
+            'api_update_interval', DEFAULT_API_UPDATE_INTERVAL,
+            above=0.01, maxval=1.0)
+        self.max_host_samples = config.getint(
+            'max_host_samples', 20000, minval=1000)
+
+        self.lifecycle_lock = threading.Lock()
+        self.write_lock = threading.Lock()
+        self.control_condition = threading.Condition()
+        self.data_lock = threading.Lock()
+        self.serial_conn = None
+        self.reader_thread = None
+        self.reader_running = False
+        self.binary_mode = False
+        self.reader_error = None
+        self.stream_clients = 0
+        self.streaming = False
+        self.stream_start_pending = False
+        self.ack_stop = None
+        self.ack_stream_start = None
+        self.ack_bandwidth = None
+        self.stream_stopped = False
+        self.idle_sync_responses = {}
+        self.stream_sync_pending = {}
+        self.stream_sync_responses = []
+        self.next_sync_sequence = 1
+        self.sync_timer = None
+        self.sync_timeouts = 0
+        self.clock_mapper = TrinkeyClockMapper()
+        self.sample_queues = {
+            sensor: collections.deque(maxlen=self.max_host_samples)
+            for sensor in ('base', 'toolhead')
+        }
+
+        self.host_queue_drops = 0
+        self.frame_errors = 0
+        self.packet_sequence_errors = 0
+        self.last_packet_sequence = None
+        self.read_errors = 0
+        self.firmware_status = {}
+
+        self.sensor_dumps = {
+            sensor: TrinkeySensorDump(self, sensor, api_update_interval)
+            for sensor in ('base', 'toolhead')
+        }
+        gcode = self.printer.lookup_object('gcode')
+        gcode.register_command(
+            'TRINKEY_ACCEL_STATUS', self.cmd_TRINKEY_ACCEL_STATUS,
+            desc=self.cmd_TRINKEY_ACCEL_STATUS_help)
+        self.printer.register_event_handler(
+            'klippy:shutdown', self._handle_shutdown)
+        self.printer.register_event_handler(
+            'klippy:disconnect', self._handle_shutdown)
+
+    def _command_error(self, message):
+        return self.printer.command_error(message)
+
+    def _send_command(self, command):
+        if self.serial_conn is None:
+            raise self._command_error("Trinkey serial port is not open")
+        data = (command + '\n').encode('ascii')
+        with self.write_lock:
+            self.serial_conn.write(data)
+            self.serial_conn.flush()
+
+    def _wait_for(
+            self, predicate, timeout, message, raise_on_timeout=True):
+        deadline = self.reactor.monotonic() + timeout
+        with self.control_condition:
+            while not predicate():
+                if self.reader_error is not None:
+                    raise self._command_error(
+                        "Trinkey reader failed: %s" % (self.reader_error,))
+                remaining = deadline - self.reactor.monotonic()
+                if remaining <= 0.:
+                    if not raise_on_timeout:
+                        return False
+                    raise self._command_error(message)
+                self.control_condition.wait(remaining)
+            return True
+
+    def _open_serial(self):
+        try:
+            self.serial_conn = serial.Serial(
+                self.port, SERIAL_BAUD, timeout=0.050, write_timeout=0.500)
+            self.serial_conn.reset_input_buffer()
+        except Exception as e:
+            raise self._command_error(
+                "Unable to open Trinkey serial port %s: %s"
+                % (self.port, e))
+        self.reader_error = None
+        self.reader_running = True
+        self.binary_mode = False
+        self.reader_thread = threading.Thread(target=self._reader_loop)
+        self.reader_thread.daemon = True
+        self.reader_thread.start()
+
+    def _close_serial(self):
+        self.reader_running = False
+        if self.reader_thread is not None:
+            self.reader_thread.join(0.500)
+            self.reader_thread = None
+        if self.serial_conn is not None:
+            try:
+                self.serial_conn.close()
+            except Exception:
+                logging.exception("Unable to close Trinkey serial port")
+            self.serial_conn = None
+        self.binary_mode = False
+        self.streaming = False
+        self.stream_start_pending = False
+
+    def _recover_idle(self):
+        with self.control_condition:
+            self.ack_stop = None
+        deadline = self.reactor.monotonic() + CONTROL_TIMEOUT
+        while self.reactor.monotonic() < deadline:
+            self._send_command('')
+            self._send_command('STREAM_STOP')
+            self._send_command('STOP')
+            with self.control_condition:
+                if self.ack_stop is not None:
+                    return
+                if self.reader_error is not None:
+                    raise self._command_error(
+                        "Trinkey reader failed: %s" % (self.reader_error,))
+                self.control_condition.wait(CONTROL_RETRY_INTERVAL)
+                if self.ack_stop is not None:
+                    return
+        raise self._command_error("Timed out putting Trinkey into idle mode")
+
+    def _idle_sync_once(self):
+        sequence = self.next_sync_sequence
+        self.next_sync_sequence += 1
+        host_before = self.reactor.monotonic()
+        self._send_command('SYNC,%d' % (sequence,))
+        self._wait_for(
+            lambda: sequence in self.idle_sync_responses,
+            SYNC_TIMEOUT,
+            "Timed out waiting for Trinkey SYNC %d" % (sequence,))
+        with self.control_condition:
+            device_time_us, host_after = self.idle_sync_responses.pop(sequence)
+        host_mid = .5 * (host_before + host_after)
+        print_time = self.mcu.estimated_print_time(host_mid)
+        self.clock_mapper.add(
+            device_time_us, print_time, host_after - host_before)
+
+    def _start_stream(self):
+        self.clock_mapper.reset()
+        with self.data_lock:
+            for queue in self.sample_queues.values():
+                queue.clear()
+        with self.control_condition:
+            self.stream_sync_pending.clear()
+            self.stream_sync_responses = []
+            self.idle_sync_responses.clear()
+        self.host_queue_drops = 0
+        self.frame_errors = 0
+        self.packet_sequence_errors = 0
+        self.last_packet_sequence = None
+        self.read_errors = 0
+        self.sync_timeouts = 0
+        self.firmware_status = {}
+        self._open_serial()
+        try:
+            self._recover_idle()
+            with self.control_condition:
+                self.ack_bandwidth = None
+            self._send_command('SET_BW,%d' % (self.bandwidth,))
+            self._wait_for(
+                lambda: self.ack_bandwidth is not None,
+                CONTROL_TIMEOUT,
+                "Timed out configuring Trinkey accelerometer bandwidth")
+            if self.ack_bandwidth != self.bandwidth:
+                raise self._command_error(
+                    "Trinkey acknowledged unexpected bandwidth %s"
+                    % (self.ack_bandwidth,))
+            for unused in range(self.initial_sync_samples):
+                self._idle_sync_once()
+                time.sleep(0.010)
+
+            with self.control_condition:
+                self.ack_stream_start = None
+                self.stream_stopped = False
+            run_id = 'motan_%d' % (int(time.time()),)
+            self.stream_start_pending = True
+            self._send_command(
+                'STREAM_START,%s,%s,%d,%d'
+                % (run_id, self.mode, self.rate, self.batch_size))
+            self._wait_for(
+                lambda: self.ack_stream_start is not None,
+                CONTROL_TIMEOUT,
+                "Timed out starting Trinkey stream")
+            ack = self.ack_stream_start
+            if (ack[1] != self.mode or int(ack[2]) != self.rate
+                    or int(ack[3]) != self.batch_size
+                    or int(ack[4]) != STREAM_PROTOCOL_VERSION):
+                raise self._command_error(
+                    "Unexpected Trinkey stream acknowledgement: %s"
+                    % (ack,))
+            self.streaming = True
+            self.stream_start_pending = False
+            self.sync_timer = self.reactor.register_timer(
+                self._sync_timer_event,
+                self.reactor.monotonic() + self.sync_interval)
+            logging.info(
+                "Trinkey accelerometer stream started: %s at %d Hz, "
+                "batch=%d", self.mode, self.rate, self.batch_size)
+        except Exception:
+            self._stop_stream()
+            raise
+
+    def _request_stream_stop(self):
+        with self.control_condition:
+            self.stream_stopped = False
+        deadline = self.reactor.monotonic() + CONTROL_TIMEOUT
+        while self.reactor.monotonic() < deadline:
+            self._send_command('STREAM_STOP')
+            remaining = min(
+                CONTROL_RETRY_INTERVAL,
+                deadline - self.reactor.monotonic())
+            if self._wait_for(
+                    lambda: self.stream_stopped, remaining,
+                    "Timed out stopping Trinkey stream",
+                    raise_on_timeout=False):
+                return
+        raise self._command_error("Timed out stopping Trinkey stream")
+
+    def _stop_stream(self):
+        if self.sync_timer is not None:
+            self.reactor.unregister_timer(self.sync_timer)
+            self.sync_timer = None
+        if (self.serial_conn is not None
+                and (self.streaming or self.stream_start_pending)):
+            try:
+                self._request_stream_stop()
+            except Exception:
+                logging.exception("Unable to stop Trinkey stream cleanly")
+        self._close_serial()
+        logging.info("Trinkey accelerometer stream stopped")
+
+    def add_stream_client(self):
+        with self.lifecycle_lock:
+            self.stream_clients += 1
+            if self.stream_clients > 1:
+                return
+            try:
+                self._start_stream()
+            except Exception:
+                self.stream_clients = 0
+                raise
+
+    def remove_stream_client(self):
+        with self.lifecycle_lock:
+            if self.stream_clients <= 0:
+                return
+            self.stream_clients -= 1
+            if self.stream_clients == 0:
+                self._stop_stream()
+
+    def _handle_shutdown(self):
+        with self.lifecycle_lock:
+            self.stream_clients = 0
+            self._stop_stream()
+
+    def _reader_loop(self):
+        pending = bytearray()
+        try:
+            while self.reader_running:
+                available = self.serial_conn.in_waiting
+                chunk = self.serial_conn.read(min(available, 4096) or 1)
+                if not chunk:
+                    continue
+                pending.extend(chunk)
+                while True:
+                    delimiter = b'\x00' if self.binary_mode else b'\n'
+                    end = pending.find(delimiter)
+                    if end < 0:
+                        break
+                    record = bytes(pending[:end])
+                    del pending[:end + 1]
+                    host_time = self.reactor.monotonic()
+                    if self.binary_mode:
+                        if record:
+                            self._handle_binary_record(record, host_time)
+                    else:
+                        line = record.rstrip(b'\r').decode(
+                            'utf-8', 'replace')
+                        if line:
+                            self._handle_ascii_line(line, host_time)
+                if len(pending) > SERIAL_RECORD_LIMIT:
+                    raise IOError(
+                        "Trinkey serial record exceeded %d bytes"
+                        % (SERIAL_RECORD_LIMIT,))
+        except Exception as e:
+            if self.reader_running:
+                self.reader_error = e
+                logging.exception("Trinkey stream reader failed")
+            self.reader_running = False
+            with self.control_condition:
+                self.control_condition.notify_all()
+
+    def _handle_ascii_line(self, line, host_time):
+        for match in ACK_STOP_RE.finditer(line):
+            with self.control_condition:
+                self.ack_stop = match.group(0)
+                self.control_condition.notify_all()
+        for match in SYNC_RE.finditer(line):
+            sequence, device_time_us = match.groups()
+            with self.control_condition:
+                self.idle_sync_responses[int(sequence)] = (
+                    int(device_time_us), host_time)
+                self.control_condition.notify_all()
+        for match in ACK_STREAM_START_RE.finditer(line):
+            with self.control_condition:
+                self.ack_stream_start = match.groups()
+                self.binary_mode = True
+                self.control_condition.notify_all()
+        for match in ACK_BW_RE.finditer(line):
+            with self.control_condition:
+                self.ack_bandwidth = int(match.group(1))
+                self.control_condition.notify_all()
+        if line.startswith('ERR,NOT_STREAMING'):
+            with self.control_condition:
+                self.stream_stopped = True
+                self.control_condition.notify_all()
+        elif line.startswith('ERR,'):
+            logging.warning("Trinkey firmware response: %s", line)
+
+    def _handle_binary_record(self, encoded, host_time):
+        try:
+            raw = _cobs_decode(encoded)
+            if len(raw) < 11:
+                raise ValueError("short stream frame")
+            magic, frame_type, payload_length = struct.unpack_from(
+                '<IBH', raw, 0)
+            if magic != STREAM_MAGIC:
+                raise ValueError("bad stream magic")
+            if len(raw) != 7 + payload_length + 4:
+                raise ValueError("bad stream payload length")
+            expected_crc = struct.unpack_from('<I', raw, len(raw) - 4)[0]
+            actual_crc = zlib.crc32(raw[:-4]) & 0xffffffff
+            if expected_crc != actual_crc:
+                raise ValueError("bad stream CRC")
+            payload = raw[7:-4]
+            if frame_type == STREAM_FRAME_DATA:
+                self._handle_data_frame(payload)
+            elif frame_type == STREAM_FRAME_SYNC:
+                self._handle_sync_frame(payload, host_time)
+            elif frame_type == STREAM_FRAME_STOP:
+                self._handle_status_frame(payload)
+                with self.control_condition:
+                    self.stream_stopped = True
+                    self.binary_mode = False
+                    self.control_condition.notify_all()
+            elif frame_type == STREAM_FRAME_STATUS:
+                self._handle_status_frame(payload)
+            else:
+                raise ValueError("unknown stream frame type %d" % frame_type)
+        except Exception:
+            self.frame_errors += 1
+            logging.exception("Invalid Trinkey stream frame")
+
+    def _handle_data_frame(self, payload):
+        if len(payload) < STREAM_DATA_HEADER.size:
+            raise ValueError("short data frame")
+        values = STREAM_DATA_HEADER.unpack_from(payload)
+        (packet_sequence, sample_rate, sensor_mask, sample_count,
+         total_sample_count, dropped_count, transport_dropped_count,
+         overrun_count, max_loop_us, max_base_read_us,
+         max_toolhead_read_us) = values
+        expected_length = (
+            STREAM_DATA_HEADER.size + sample_count * STREAM_SAMPLE.size)
+        if len(payload) != expected_length:
+            raise ValueError("incorrect data-frame sample count")
+        if self.last_packet_sequence is not None:
+            expected_sequence = (self.last_packet_sequence + 1) & 0xffffffff
+            if packet_sequence != expected_sequence:
+                self.packet_sequence_errors += (
+                    packet_sequence - expected_sequence) & 0xffffffff
+        self.last_packet_sequence = packet_sequence
+        self.firmware_status = {
+            'sample_rate': sample_rate,
+            'sensor_mask': sensor_mask,
+            'sample_count': total_sample_count,
+            'dropped': dropped_count,
+            'transport_dropped': transport_dropped_count,
+            'overruns': overrun_count,
+            'max_loop_us': max_loop_us,
+            'max_base_read_us': max_base_read_us,
+            'max_toolhead_read_us': max_toolhead_read_us,
+        }
+
+        decoded = []
+        offset = STREAM_DATA_HEADER.size
+        for unused in range(sample_count):
+            decoded.append(STREAM_SAMPLE.unpack_from(payload, offset))
+            offset += STREAM_SAMPLE.size
+
+        with self.data_lock:
+            for sample in decoded:
+                (sequence, base_t_us, base_x, base_y, base_z,
+                 tool_t_us, tool_x, tool_y, tool_z, flags) = sample
+                if flags & FLAG_BASE_VALID:
+                    queue = self.sample_queues['base']
+                    if len(queue) == queue.maxlen:
+                        self.host_queue_drops += 1
+                    queue.append((
+                        sequence, base_t_us, base_x, base_y, base_z, flags))
+                elif flags & FLAG_BASE_ERROR:
+                    self.read_errors += 1
+                if flags & FLAG_TOOLHEAD_VALID:
+                    queue = self.sample_queues['toolhead']
+                    if len(queue) == queue.maxlen:
+                        self.host_queue_drops += 1
+                    queue.append((
+                        sequence, tool_t_us, tool_x, tool_y, tool_z, flags))
+                elif flags & FLAG_TOOLHEAD_ERROR:
+                    self.read_errors += 1
+
+    def _handle_sync_frame(self, payload, host_after):
+        if len(payload) != STREAM_SYNC.size:
+            raise ValueError("incorrect sync-frame length")
+        sequence, device_time_us = STREAM_SYNC.unpack(payload)
+        with self.control_condition:
+            host_before = self.stream_sync_pending.pop(sequence, None)
+            if host_before is not None:
+                self.stream_sync_responses.append(
+                    (device_time_us, host_before, host_after))
+            self.control_condition.notify_all()
+
+    def _handle_status_frame(self, payload):
+        if len(payload) != STREAM_STATUS.size:
+            raise ValueError("incorrect status-frame length")
+        values = STREAM_STATUS.unpack(payload)
+        (sample_rate, batch_size, sensor_mask, sample_count, dropped_count,
+         transport_dropped_count, overrun_count, max_loop_us,
+         max_base_read_us, max_toolhead_read_us) = values
+        self.firmware_status = {
+            'sample_rate': sample_rate,
+            'batch_size': batch_size,
+            'sensor_mask': sensor_mask,
+            'sample_count': sample_count,
+            'dropped': dropped_count,
+            'transport_dropped': transport_dropped_count,
+            'overruns': overrun_count,
+            'max_loop_us': max_loop_us,
+            'max_base_read_us': max_base_read_us,
+            'max_toolhead_read_us': max_toolhead_read_us,
+        }
+
+    def _sync_timer_event(self, eventtime):
+        if not self.streaming or self.serial_conn is None:
+            return self.reactor.NEVER
+        host_before = self.reactor.monotonic()
+        sequence = self.next_sync_sequence
+        self.next_sync_sequence += 1
+        with self.control_condition:
+            self.stream_sync_pending[sequence] = host_before
+            stale_before = host_before - SYNC_TIMEOUT
+            stale = [key for key, value in self.stream_sync_pending.items()
+                     if value < stale_before]
+            for key in stale:
+                del self.stream_sync_pending[key]
+            self.sync_timeouts += len(stale)
+        try:
+            self._send_command('STREAM_SYNC,%d' % (sequence,))
+        except Exception:
+            with self.control_condition:
+                if self.stream_sync_pending.pop(sequence, None) is not None:
+                    self.sync_timeouts += 1
+            logging.exception("Unable to send Trinkey stream sync")
+        return eventtime + self.sync_interval
+
+    def _update_clock_mapping(self):
+        with self.control_condition:
+            responses = self.stream_sync_responses
+            self.stream_sync_responses = []
+        for device_time_us, host_before, host_after in responses:
+            host_mid = .5 * (host_before + host_after)
+            print_time = self.mcu.estimated_print_time(host_mid)
+            self.clock_mapper.add(
+                device_time_us, print_time, host_after - host_before)
+
+    def api_update(self, sensor, eventtime):
+        if self.reader_error is not None:
+            raise self._command_error(
+                "Trinkey reader failed: %s" % (self.reader_error,))
+        self._update_clock_mapping()
+        with self.data_lock:
+            samples = list(self.sample_queues[sensor])
+            self.sample_queues[sensor].clear()
+        if not samples or not self.clock_mapper.ready:
+            return {}
+        scale = self.raw_scale
+        data = []
+        for sequence, device_time_us, x_raw, y_raw, z_raw, flags in samples:
+            print_time = self.clock_mapper.get_print_time(device_time_us)
+            data.append((
+                round(print_time, 9), device_time_us, sequence,
+                x_raw, y_raw, z_raw,
+                round(x_raw * scale, 6),
+                round(y_raw * scale, 6),
+                round(z_raw * scale, 6), flags))
+        clock_status = self.clock_mapper.get_status()
+        return {
+            'data': data,
+            'firmware': dict(self.firmware_status),
+            'clock': clock_status,
+            'host_queue_drops': self.host_queue_drops,
+            'frame_errors': self.frame_errors,
+            'packet_sequence_errors': self.packet_sequence_errors,
+            'sync_timeouts': self.sync_timeouts,
+            'read_errors': self.read_errors,
+        }
+
+    def start_internal_client(self, sensor):
+        if sensor not in self.sensor_dumps:
+            raise self._command_error(
+                "Unknown Trinkey accelerometer '%s'" % (sensor,))
+        return self.sensor_dumps[sensor].start_internal_client()
+
+    def is_streaming(self):
+        return self.streaming or self.stream_clients > 0
+
+    cmd_TRINKEY_ACCEL_STATUS_help = (
+        "Report Trinkey streaming, timing, and loss diagnostics")
+    def cmd_TRINKEY_ACCEL_STATUS(self, gcmd):
+        status = self.get_status(self.reactor.monotonic())
+        keys = (
+            'streaming', 'rate', 'batch_size', 'bandwidth',
+            'clock_ready', 'clock_points', 'clock_accepted_points',
+            'clock_rtt_minimum', 'clock_rtt_limit',
+            'clock_rtt_tolerance', 'clock_slope', 'clock_last_rtt',
+            'sync_timeouts', 'reader_alive', 'reader_error',
+            'firmware_sample_count',
+            'firmware_dropped', 'firmware_transport_dropped',
+            'firmware_overruns', 'firmware_max_loop_us',
+            'firmware_max_base_read_us',
+            'firmware_max_toolhead_read_us', 'host_queue_drops',
+            'packet_sequence_errors', 'frame_errors', 'read_errors')
+        fields = [
+            '%s=%s' % (key, status[key])
+            for key in keys if key in status]
+        gcmd.respond_info('Trinkey accel: ' + ' '.join(fields))
+
+    def get_status(self, eventtime):
+        clock_status = self.clock_mapper.get_status()
+        status = {
+            'connected': self.serial_conn is not None,
+            'streaming': self.streaming,
+            'rate': self.rate,
+            'batch_size': self.batch_size,
+            'bandwidth': self.bandwidth,
+            'sensors': self.sensors,
+            'clock_ready': clock_status['ready'],
+            'clock_points': clock_status['points'],
+            'clock_accepted_points': clock_status['accepted_points'],
+            'clock_rtt_minimum': clock_status['rtt_minimum'],
+            'clock_rtt_limit': clock_status['rtt_limit'],
+            'clock_rtt_tolerance': clock_status['rtt_tolerance'],
+            'clock_slope': clock_status['slope'],
+            'clock_offset': clock_status['offset'],
+            'clock_last_rtt': clock_status['last_rtt'],
+            'clock_last_device_time_us':
+                clock_status['last_device_time_us'],
+            'clock_last_print_time': clock_status['last_print_time'],
+            'sync_timeouts': self.sync_timeouts,
+            'reader_alive': bool(
+                self.reader_thread is not None
+                and self.reader_thread.is_alive()),
+            'reader_error': ('' if self.reader_error is None
+                             else str(self.reader_error)),
+            'host_queue_drops': self.host_queue_drops,
+            'frame_errors': self.frame_errors,
+            'packet_sequence_errors': self.packet_sequence_errors,
+            'read_errors': self.read_errors,
+        }
+        status.update(
+            ('firmware_' + key, value)
+            for key, value in self.firmware_status.items())
+        return status
+
+
+def load_config(config):
+    return TrinkeyAccel(config)
