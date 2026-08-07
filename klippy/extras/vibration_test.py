@@ -24,6 +24,9 @@ DEFAULT_TRINKEY_DUMP_TIMEOUT = 90.0
 TRINKEY_CONTROL_RETRY_INTERVAL = 0.500
 TRINKEY_SYNC_INTERVAL = 0.010
 TRINKEY_SERIAL_BUFFER_LIMIT = 65536
+TRINKEY_BUFFERED_SAMPLE_RATE = 500
+TRINKEY_BUFFERED_BANDWIDTH = 250
+TRINKEY_BUFFERED_CAPACITY = 4608
 
 TRINKEY_SAMPLE_RE = re.compile(
     r'A,(base|toolhead),(\d+),(\d+),(-?\d+),(-?\d+),(-?\d+)')
@@ -358,10 +361,30 @@ class TrinkeyLogger:
                 "Invalid Trinkey DUMP_END record")
 
         stored_count = int(match.group(3))
+        sample_count = int(match.group(4))
+        dropped_count = int(match.group(5))
+        overrun_count = int(match.group(6))
+        capacity = int(match.group(7))
+        sample_rate = int(match.group(8))
         mode = match.group(9)
         chips = ('base', 'toolhead') if mode == 'both' else (mode,)
         expected = set(range(stored_count))
         problems = []
+        if sample_rate != TRINKEY_BUFFERED_SAMPLE_RATE:
+            problems.append(
+                "sample_rate=%d expected=%d"
+                % (sample_rate, TRINKEY_BUFFERED_SAMPLE_RATE))
+        if capacity < TRINKEY_BUFFERED_CAPACITY:
+            problems.append(
+                "capacity=%d expected_at_least=%d"
+                % (capacity, TRINKEY_BUFFERED_CAPACITY))
+        if dropped_count:
+            problems.append("buffer_dropped=%d" % (dropped_count,))
+        if overrun_count:
+            problems.append("sampling_overruns=%d" % (overrun_count,))
+        if stored_count != sample_count:
+            problems.append(
+                "stored=%d sampled=%d" % (stored_count, sample_count))
         for chip_id in chips:
             received = self.dump_record_ids[chip_id]
             missing = len(expected - received)
@@ -817,6 +840,11 @@ class VibrationTest:
         Returns:
             Logger for the configured Trinkey and output directory.
         """
+        stream = self.printer.lookup_object('trinkey_accel', None)
+        if stream is not None and stream.is_streaming():
+            raise gcmd.error(
+                "Trinkey streaming is active; stop the Motan logger before "
+                "RUN_VIBRATION_TEST")
         run_id = gcmd.get('RUN_ID')
         return TrinkeyLogger(
             self.printer, self.trinkey_port, self.trinkey_log_dir, run_id)
@@ -854,6 +882,13 @@ class VibrationTest:
             'chunk_time_s': CHUNK_TIME,
             'peak_velocity_mm_s': max_v,
             'peak_accel_mm_s2': max_a,
+            'accelerometer': {
+                'model': 'BNO055',
+                'range_g': 4,
+                'bandwidth_hz': TRINKEY_BUFFERED_BANDWIDTH,
+                'buffered_rate_hz': TRINKEY_BUFFERED_SAMPLE_RATE,
+                'buffer_capacity_samples': TRINKEY_BUFFERED_CAPACITY,
+            },
             'sample_units': {
                 'accel_raw': 'BNO055 raw acceleration LSB',
                 'trinkey_t_us': 'Trinkey time_us_64 microseconds',
