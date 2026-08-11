@@ -682,3 +682,12 @@ filtered_bspline_stepper_set_sk(struct stepper_kinematics *sk
     wrapper->sk.active_flags = orig_sk->active_flags;
     return 0;
 }
+
+// Generate preview pre-action and settling steps outside nominal axis moves.
+void __visible
+filtered_bspline_stepper_set_generation_window(
+    struct stepper_kinematics *sk, double window)
+{
+    sk->gen_steps_pre_active = window;
+    sk->gen_steps_post_active = window;
+}

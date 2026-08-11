@@ -144,6 +144,10 @@ class FilteredBSpline:
         self.toolhead.note_step_generation_scan_time(
             new_delay, old_delay=old_delay)
         self.ffi_lib.filtered_bspline_set_enabled(self.controller, enabled)
+        for wrapper in self.stepper_kinematics:
+            # Include pre-action and settling outside nominal axis moves.
+            self.ffi_lib.filtered_bspline_stepper_set_generation_window(
+                wrapper, new_delay)
         self.enabled = enabled
 
     cmd_SET_FILTERED_BSPLINE_help = (

@@ -172,6 +172,8 @@ defs_kin_filtered_bspline = """
         struct fbf_controller *controller);
     int filtered_bspline_stepper_set_sk(struct stepper_kinematics *sk
         , struct stepper_kinematics *orig_sk);
+    void filtered_bspline_stepper_set_generation_window(
+        struct stepper_kinematics *sk, double window);
 """
 
 defs_serialqueue = """
