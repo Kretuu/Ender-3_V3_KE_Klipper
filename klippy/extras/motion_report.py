@@ -64,6 +64,16 @@ class APIDumpHelper:
         self._start()
         return cconn
     def _update(self, eventtime):
+        # Prune disconnected clients before requesting new data.  In
+        # particular, a sensor callback may legitimately return no data.  If
+        # cleanup happens only after that callback, a disconnected client can
+        # keep the sensor active forever and prevent a later client from
+        # restarting it.
+        for cconn in list(self.clients):
+            if cconn.is_closed():
+                del self.clients[cconn]
+        if not self.clients:
+            return self._stop()
         try:
             msg = self.data_cb(eventtime)
         except self.printer.command_error as e:

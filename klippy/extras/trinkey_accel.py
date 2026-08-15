@@ -27,7 +27,7 @@ FLAG_TOOLHEAD_VALID = 0x02
 FLAG_BASE_ERROR = 0x04
 FLAG_TOOLHEAD_ERROR = 0x08
 
-ACK_STOP_RE = re.compile(r'ACK_STOP,(\d+),(\d+),(\d+),(\d+),(\d+)')
+ACK_STREAM_STOP_RE = re.compile(r'ACK_STREAM_STOP,(\d+)')
 ACK_STREAM_START_RE = re.compile(
     r'ACK_STREAM_START,([^,\r\n]*),(base|toolhead|both),(\d+),(\d+),'
     r'(\d+),(\d+)')
@@ -44,6 +44,31 @@ DEFAULT_SYNC_INTERVAL = 1.0
 DEFAULT_INITIAL_SYNC_SAMPLES = 12
 DEFAULT_RAW_SCALE = 10.0  # BNO055 default m/s^2 units: 100 LSB/(m/s^2)
 SYNC_RTT_TOLERANCE = 0.001  # Experiment-specific USB RTT margin, seconds.
+TRAPQ_HISTORY_SAFE_AGE = 25.0  # trapq.c retains 30 seconds of history.
+
+
+def _sample_trapq_acceleration(moves, timed_keys):
+    """Return nominal XYZ acceleration for sorted (time, key) requests."""
+    results = {}
+    move_index = 0
+    for print_time, key in timed_keys:
+        while move_index < len(moves):
+            move = moves[move_index]
+            if print_time < move.print_time + move.move_t:
+                break
+            move_index += 1
+        if move_index >= len(moves):
+            results[key] = (0., 0., 0.)
+            continue
+        move = moves[move_index]
+        if print_time < move.print_time:
+            results[key] = (0., 0., 0.)
+            continue
+        results[key] = (
+            move.accel * move.x_r,
+            move.accel * move.y_r,
+            move.accel * move.z_r)
+    return results
 
 
 def _cobs_decode(data):
@@ -178,6 +203,43 @@ class TrinkeySensorDump:
         return self.api_dump.add_internal_client()
 
 
+class TrinkeyExperimentDump:
+    """Combined sensor and sampled nominal-motion stream for experiments."""
+    def __init__(self, parent, update_interval):
+        self.parent = parent
+        self.api_dump = motion_report.APIDumpHelper(
+            parent.printer, self._api_update, self._api_startstop,
+            update_interval)
+        webhooks = parent.printer.lookup_object('webhooks')
+        webhooks.register_endpoint(
+            'trinkey_accel/dump_experiment', self._handle_dump)
+
+    def _api_startstop(self, is_start):
+        if is_start:
+            self.parent.add_stream_client()
+        else:
+            self.parent.remove_stream_client()
+
+    def _api_update(self, eventtime):
+        return self.parent.api_update_experiment(eventtime)
+
+    def _handle_dump(self, web_request):
+        self.api_dump.add_client(web_request)
+        common_header = (
+            'time', 'device_time_us', 'sample_sequence',
+            'x_raw', 'y_raw', 'z_raw',
+            'x_acceleration', 'y_acceleration', 'z_acceleration', 'flags')
+        web_request.send({
+            'headers': {
+                'base': common_header + (
+                    'command_y_acceleration', 'reference_valid'),
+                'toolhead': common_header + (
+                    'command_x_acceleration', 'reference_valid'),
+            },
+            'reference': 'nominal_toolhead_trapq_at_sample_time',
+        })
+
+
 class TrinkeyAccel:
     def __init__(self, config):
         self.printer = config.get_printer()
@@ -230,7 +292,7 @@ class TrinkeyAccel:
         self.stream_clients = 0
         self.streaming = False
         self.stream_start_pending = False
-        self.ack_stop = None
+        self.ack_stream_stop = None
         self.ack_stream_start = None
         self.ack_bandwidth = None
         self.stream_stopped = False
@@ -257,6 +319,8 @@ class TrinkeyAccel:
             sensor: TrinkeySensorDump(self, sensor, api_update_interval)
             for sensor in ('base', 'toolhead')
         }
+        self.experiment_dump = TrinkeyExperimentDump(
+            self, api_update_interval)
         gcode = self.printer.lookup_object('gcode')
         gcode.register_command(
             'TRINKEY_ACCEL_STATUS', self.cmd_TRINKEY_ACCEL_STATUS,
@@ -303,8 +367,10 @@ class TrinkeyAccel:
                 "Unable to open Trinkey serial port %s: %s"
                 % (self.port, e))
         self.reader_error = None
-        self.reader_running = True
         self.binary_mode = False
+
+    def _start_reader(self):
+        self.reader_running = True
         self.reader_thread = threading.Thread(target=self._reader_loop)
         self.reader_thread.daemon = True
         self.reader_thread.start()
@@ -325,22 +391,33 @@ class TrinkeyAccel:
         self.stream_start_pending = False
 
     def _recover_idle(self):
-        with self.control_condition:
-            self.ack_stop = None
+        # The previous logger may have exited while the firmware was emitting
+        # zero-delimited binary frames. Recover before starting the reader so
+        # that stale binary data can never be parsed as newline-delimited
+        # control responses. STREAM_STOP is idempotent and its ASCII response
+        # follows the final binary STOP frame when a stream was active.
+        self.ack_stream_stop = None
+        response = bytearray()
         deadline = self.reactor.monotonic() + CONTROL_TIMEOUT
+        next_request = 0.
         while self.reactor.monotonic() < deadline:
-            self._send_command('')
-            self._send_command('STREAM_STOP')
-            self._send_command('STOP')
-            with self.control_condition:
-                if self.ack_stop is not None:
-                    return
-                if self.reader_error is not None:
-                    raise self._command_error(
-                        "Trinkey reader failed: %s" % (self.reader_error,))
-                self.control_condition.wait(CONTROL_RETRY_INTERVAL)
-                if self.ack_stop is not None:
-                    return
+            now = self.reactor.monotonic()
+            if now >= next_request:
+                self._send_command('STREAM_STOP')
+                next_request = now + CONTROL_RETRY_INTERVAL
+            available = self.serial_conn.in_waiting
+            chunk = self.serial_conn.read(min(available, 4096) or 1)
+            if not chunk:
+                continue
+            response.extend(chunk)
+            if len(response) > SERIAL_RECORD_LIMIT:
+                del response[:-SERIAL_RECORD_LIMIT]
+            match = ACK_STREAM_STOP_RE.search(
+                response.decode('utf-8', 'replace'))
+            if match is not None:
+                self.ack_stream_stop = match.group(0)
+                self.serial_conn.reset_input_buffer()
+                return
         raise self._command_error("Timed out putting Trinkey into idle mode")
 
     def _idle_sync_once(self):
@@ -378,6 +455,7 @@ class TrinkeyAccel:
         self._open_serial()
         try:
             self._recover_idle()
+            self._start_reader()
             with self.control_condition:
                 self.ack_bandwidth = None
             self._send_command('SET_BW,%d' % (self.bandwidth,))
@@ -427,6 +505,7 @@ class TrinkeyAccel:
     def _request_stream_stop(self):
         with self.control_condition:
             self.stream_stopped = False
+            self.ack_stream_stop = None
         deadline = self.reactor.monotonic() + CONTROL_TIMEOUT
         while self.reactor.monotonic() < deadline:
             self._send_command('STREAM_STOP')
@@ -434,7 +513,7 @@ class TrinkeyAccel:
                 CONTROL_RETRY_INTERVAL,
                 deadline - self.reactor.monotonic())
             if self._wait_for(
-                    lambda: self.stream_stopped, remaining,
+                    lambda: self.ack_stream_stop is not None, remaining,
                     "Timed out stopping Trinkey stream",
                     raise_on_timeout=False):
                 return
@@ -515,9 +594,10 @@ class TrinkeyAccel:
                 self.control_condition.notify_all()
 
     def _handle_ascii_line(self, line, host_time):
-        for match in ACK_STOP_RE.finditer(line):
+        for match in ACK_STREAM_STOP_RE.finditer(line):
             with self.control_condition:
-                self.ack_stop = match.group(0)
+                self.ack_stream_stop = match.group(0)
+                self.stream_stopped = True
                 self.control_condition.notify_all()
         for match in SYNC_RE.finditer(line):
             sequence, device_time_us = match.groups()
@@ -534,11 +614,7 @@ class TrinkeyAccel:
             with self.control_condition:
                 self.ack_bandwidth = int(match.group(1))
                 self.control_condition.notify_all()
-        if line.startswith('ERR,NOT_STREAMING'):
-            with self.control_condition:
-                self.stream_stopped = True
-                self.control_condition.notify_all()
-        elif line.startswith('ERR,'):
+        if line.startswith('ERR,'):
             logging.warning("Trinkey firmware response: %s", line)
 
     def _handle_binary_record(self, encoded, host_time):
@@ -727,6 +803,85 @@ class TrinkeyAccel:
             'sync_timeouts': self.sync_timeouts,
             'read_errors': self.read_errors,
         }
+
+    def api_update_experiment(self, eventtime):
+        """Return bounded sensor batches with a sampled nominal reference."""
+        if self.reader_error is not None:
+            raise self._command_error(
+                "Trinkey reader failed: %s" % (self.reader_error,))
+        self._update_clock_mapping()
+        if not self.clock_mapper.ready:
+            return {}
+
+        # A delayed event loop must not produce one unbounded JSON response.
+        # One second per sensor drains a backlog ten times faster than it is
+        # created at the default 100 ms API interval, while bounding each
+        # TrapQ extraction and socket message.
+        sample_batches = {}
+        with self.data_lock:
+            for sensor in self.sensors:
+                queue = self.sample_queues[sensor]
+                count = min(len(queue), self.rate)
+                sample_batches[sensor] = [
+                    queue.popleft() for unused in range(count)]
+        if not any(sample_batches.values()):
+            return {}
+
+        mapped = {}
+        timed_keys = []
+        for sensor, samples in sample_batches.items():
+            sensor_rows = []
+            for row_index, sample in enumerate(samples):
+                (sequence, device_time_us, x_raw, y_raw, z_raw,
+                 flags) = sample
+                print_time = self.clock_mapper.get_print_time(device_time_us)
+                sensor_rows.append((
+                    print_time, device_time_us, sequence,
+                    x_raw, y_raw, z_raw, flags))
+                timed_keys.append((print_time, (sensor, row_index)))
+            mapped[sensor] = sensor_rows
+        timed_keys.sort()
+
+        start_time = timed_keys[0][0]
+        end_time = timed_keys[-1][0] + 1.e-9
+        motion = self.printer.lookup_object('motion_report')
+        toolhead_trapq = motion.trapqs.get('toolhead')
+        if toolhead_trapq is None:
+            raise self._command_error(
+                "Toolhead TrapQ is unavailable for Trinkey reference data")
+        moves, _cdata = toolhead_trapq.extract_trapq(start_time, end_time)
+        references = _sample_trapq_acceleration(moves, timed_keys)
+
+        current_print_time = self.mcu.estimated_print_time(eventtime)
+        valid_after = current_print_time - TRAPQ_HISTORY_SAFE_AGE
+        scale = self.raw_scale
+        data = {}
+        for sensor, rows in mapped.items():
+            output_rows = []
+            command_axis = 1 if sensor == 'base' else 0
+            for row_index, row in enumerate(rows):
+                (print_time, device_time_us, sequence,
+                 x_raw, y_raw, z_raw, flags) = row
+                command = references[(sensor, row_index)][command_axis]
+                output_rows.append((
+                    round(print_time, 9), device_time_us, sequence,
+                    x_raw, y_raw, z_raw,
+                    round(x_raw * scale, 6),
+                    round(y_raw * scale, 6),
+                    round(z_raw * scale, 6), flags,
+                    round(command, 6), int(print_time >= valid_after)))
+            data[sensor] = output_rows
+
+        data.update({
+            'firmware': dict(self.firmware_status),
+            'clock': self.clock_mapper.get_status(),
+            'host_queue_drops': self.host_queue_drops,
+            'frame_errors': self.frame_errors,
+            'packet_sequence_errors': self.packet_sequence_errors,
+            'sync_timeouts': self.sync_timeouts,
+            'read_errors': self.read_errors,
+        })
+        return data
 
     def start_internal_client(self, sensor):
         if sensor not in self.sensor_dumps:
