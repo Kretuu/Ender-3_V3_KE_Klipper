@@ -393,10 +393,24 @@ class HandleTrinkeyAccel:
          'Firmware acquisition sequence number'),
         ('trinkey_accel(<sensor>,flags)',
          'Firmware sample validity flags'),
+        ('trinkey_accel(<sensor>,desired_position)',
+         'Nominal TrapQ position at the physical sample time'),
+        ('trinkey_accel(<sensor>,desired_acceleration)',
+         'Nominal TrapQ acceleration at the physical sample time'),
+        ('trinkey_accel(<sensor>,motor_position)',
+         'Final commanded position reconstructed from step history'),
+        ('trinkey_accel(<sensor>,motor_velocity)',
+         'Final commanded velocity used by the observer'),
+        ('trinkey_accel(<sensor>,observed_position)',
+         'Observer estimate of physical axis position'),
+        ('trinkey_accel(<sensor>,observer_acceleration)',
+         'Signed and bias-corrected observer acceleration input'),
+        ('trinkey_accel(<sensor>,observer_valid)',
+         'Whether the observer sample follows a valid fixed-rate sample'),
         ('trinkey_accel(toolhead,command_x)',
-         'Nominal toolhead X acceleration at each toolhead sample time'),
+         'Legacy alias for nominal toolhead X acceleration'),
         ('trinkey_accel(base,command_y)',
-         'Nominal toolhead Y acceleration at each base sample time'),
+         'Legacy alias for nominal toolhead Y acceleration'),
         ('trinkey_accel(<sensor>,reference_valid)',
          'Whether the command reference remains inside TrapQ history'),
     ]
@@ -424,6 +438,7 @@ class HandleTrinkeyAccel:
         self.cur_data = []
         self.data_pos = 0
         selection = name_parts[2]
+        experiment_axis = 'x' if self.sensor_name == 'toolhead' else 'y'
         selectors = {
             'x': ('x_acceleration', 'Acceleration\n(mm/s^2)'),
             'y': ('y_acceleration', 'Acceleration\n(mm/s^2)'),
@@ -434,13 +449,43 @@ class HandleTrinkeyAccel:
             'device_time_us': ('device_time_us', 'Device time\n(us)'),
             'sequence': ('sample_sequence', 'Sample sequence'),
             'flags': ('flags', 'Sample flags'),
-            'command_x': (
-                'command_x_acceleration', 'Acceleration\n(mm/s^2)'),
-            'command_y': (
-                'command_y_acceleration', 'Acceleration\n(mm/s^2)'),
+            'desired_position': (
+                'desired_%s_position' % (experiment_axis,),
+                'Position\n(mm)'),
+            'desired_acceleration': (
+                'desired_%s_acceleration' % (experiment_axis,),
+                'Acceleration\n(mm/s^2)'),
+            'motor_position': (
+                'motor_%s_position' % (experiment_axis,), 'Position\n(mm)'),
+            'motor_velocity': (
+                'motor_%s_velocity' % (experiment_axis,),
+                'Velocity\n(mm/s)'),
+            'observed_position': (
+                'observed_%s_position' % (experiment_axis,),
+                'Position\n(mm)'),
+            'observer_acceleration': (
+                'observer_%s_acceleration' % (experiment_axis,),
+                'Acceleration\n(mm/s^2)'),
+            'observer_valid': ('observer_valid', 'Observer valid'),
             'reference_valid': ('reference_valid', 'Reference valid'),
         }
-        info = selectors.get(selection)
+        # Retain the dataset names used by acceleration-only captures.  The
+        # first matching column makes old and new log formats both readable.
+        legacy_columns = {
+            'command_x': (
+                ('command_x_acceleration', 'desired_x_acceleration'),
+                'Acceleration\n(mm/s^2)'),
+            'command_y': (
+                ('command_y_acceleration', 'desired_y_acceleration'),
+                'Acceleration\n(mm/s^2)'),
+        }
+        if selection in legacy_columns:
+            columns, units = legacy_columns[selection]
+            column = next((candidate for candidate in columns
+                           if candidate in header), columns[0])
+            info = (column, units)
+        else:
+            info = selectors.get(selection)
         if info is None:
             raise error("Unknown trinkey_accel data selection '%s'" % (name,))
         column, units = info

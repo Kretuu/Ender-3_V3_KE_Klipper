@@ -8,7 +8,7 @@ import sys, os, optparse, socket, select, json, errno, time, zlib
 
 INDEX_UPDATE_TIME = 5.0
 TRINKEY_DATA_WARNING = 5.0
-ClientInfo = {'program': 'motan_lightweight_logger', 'version': 'v0.2'}
+ClientInfo = {'program': 'motan_lightweight_logger', 'version': 'v0.3'}
 
 # Only subscribe to status needed to identify a run, align its print time, and
 # diagnose a failed acquisition.  The combined experiment stream is subscribed
@@ -183,9 +183,9 @@ class DataLogger:
                 "ERROR: Missing required Trinkey sensor(s): %s"
                 % (", ".join(missing),), status=1)
 
-        # This combined endpoint samples nominal toolhead TrapQ acceleration at
-        # each genuine accelerometer timestamp.  It avoids exporting the full
-        # high-density TrapQ through the Klipper webhook.
+        # This combined endpoint samples nominal motion and reconstructs final
+        # step commands at each genuine accelerometer timestamp.  It avoids
+        # exporting full high-density queues through the Klipper webhook.
         self.send_subscribe(
             "trinkey_accel:experiment", "trinkey_accel/dump_experiment", {},
             async_cb=self.handle_trinkey_dump)

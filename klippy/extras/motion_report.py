@@ -99,6 +99,11 @@ class InternalDumpClient:
         self.is_done = False
     def get_messages(self):
         return self.msgs
+    def pop_messages(self):
+        """Return queued messages and start a fresh queue for live consumers."""
+        msgs = self.msgs
+        self.msgs = []
+        return msgs
     def finalize(self):
         self.is_done = True
     def is_closed(self):

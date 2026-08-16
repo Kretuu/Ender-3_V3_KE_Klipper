@@ -7,6 +7,7 @@ import collections, logging, re, struct, threading, time, zlib
 
 import serial
 
+import chelper
 from . import motion_report
 
 
@@ -45,10 +46,11 @@ DEFAULT_INITIAL_SYNC_SAMPLES = 12
 DEFAULT_RAW_SCALE = 10.0  # BNO055 default m/s^2 units: 100 LSB/(m/s^2)
 SYNC_RTT_TOLERANCE = 0.001  # Experiment-specific USB RTT margin, seconds.
 TRAPQ_HISTORY_SAFE_AGE = 25.0  # trapq.c retains 30 seconds of history.
+OBSERVER_TIME_TOLERANCE = 0.25
 
 
-def _sample_trapq_acceleration(moves, timed_keys):
-    """Return nominal XYZ acceleration for sorted (time, key) requests."""
+def _sample_trapq_motion(moves, timed_keys):
+    """Return nominal XYZ position and acceleration at sorted times."""
     results = {}
     move_index = 0
     for print_time, key in timed_keys:
@@ -58,16 +60,25 @@ def _sample_trapq_acceleration(moves, timed_keys):
                 break
             move_index += 1
         if move_index >= len(moves):
-            results[key] = (0., 0., 0.)
+            results[key] = ((0., 0., 0.), (0., 0., 0.), False)
             continue
         move = moves[move_index]
         if print_time < move.print_time:
-            results[key] = (0., 0., 0.)
+            results[key] = (
+                (move.start_x, move.start_y, move.start_z),
+                (0., 0., 0.), True)
             continue
-        results[key] = (
+        move_time = min(move.move_t, print_time - move.print_time)
+        distance = (move.start_v + .5 * move.accel * move_time) * move_time
+        position = (
+            move.start_x + move.x_r * distance,
+            move.start_y + move.y_r * distance,
+            move.start_z + move.z_r * distance)
+        acceleration = (
             move.accel * move.x_r,
             move.accel * move.y_r,
             move.accel * move.z_r)
+        results[key] = (position, acceleration, True)
     return results
 
 
@@ -232,12 +243,22 @@ class TrinkeyExperimentDump:
         web_request.send({
             'headers': {
                 'base': common_header + (
-                    'command_y_acceleration', 'reference_valid'),
+                    'desired_y_position', 'desired_y_acceleration',
+                    'motor_y_position', 'motor_y_velocity',
+                    'observed_y_position', 'observer_y_acceleration',
+                    'observer_valid', 'reference_valid'),
                 'toolhead': common_header + (
-                    'command_x_acceleration', 'reference_valid'),
+                    'desired_x_position', 'desired_x_acceleration',
+                    'motor_x_position', 'motor_x_velocity',
+                    'observed_x_position', 'observer_x_acceleration',
+                    'observer_valid', 'reference_valid'),
             },
-            'reference': 'nominal_toolhead_trapq_at_sample_time',
+            'reference': 'nominal_trapq_and_final_step_command_at_sample_time',
         })
+
+    def start_internal_client(self):
+        """Give future hybrid control the same batches sent to Motan."""
+        return self.api_dump.add_internal_client()
 
 
 class TrinkeyAccel:
@@ -246,7 +267,7 @@ class TrinkeyAccel:
         self.reactor = self.printer.get_reactor()
         self.mcu = self.printer.lookup_object('mcu')
         self.port = config.get('serial')
-        self.rate = config.getint('rate', 400, minval=100, maxval=1000)
+        self.rate = config.getint('rate', 250, minval=100, maxval=1000)
         if 1000000 % self.rate:
             raise config.error(
                 "[trinkey_accel] rate must divide 1000000 exactly")
@@ -269,6 +290,13 @@ class TrinkeyAccel:
                      else self.sensors[0])
         self.raw_scale = config.getfloat(
             'raw_lsb_mm_s2', DEFAULT_RAW_SCALE, above=0.)
+        self.toolhead = None
+        self.kinematics = None
+        self.motion_steppers = []
+        self.observer_axes = {}
+        self.observer_resets = 0
+        self.motion_lookup_errors = 0
+        self._configure_observers(config)
         self.sync_interval = config.getfloat(
             'sync_interval', DEFAULT_SYNC_INTERVAL, above=0.1)
         self.initial_sync_samples = config.getint(
@@ -326,9 +354,135 @@ class TrinkeyAccel:
             'TRINKEY_ACCEL_STATUS', self.cmd_TRINKEY_ACCEL_STATUS,
             desc=self.cmd_TRINKEY_ACCEL_STATUS_help)
         self.printer.register_event_handler(
+            'klippy:connect', self._handle_connect)
+        self.printer.register_event_handler(
             'klippy:shutdown', self._handle_shutdown)
         self.printer.register_event_handler(
             'klippy:disconnect', self._handle_shutdown)
+
+    def _configure_observers(self, config):
+        """Load the offline-designed runtime matrices for both axes."""
+        if not config.getboolean('observer_enabled', False):
+            return
+        observer_rate = config.getint(
+            'observer_sample_rate', minval=100, maxval=1000)
+        if observer_rate != self.rate:
+            raise config.error(
+                "[trinkey_accel] observer_sample_rate must equal rate")
+        bias_samples = config.getint(
+            'observer_bias_samples', 100, minval=0, maxval=10000)
+        signs = {
+            'x': config.getfloat('observer_x_accel_sign', -1.,
+                                 minval=-1., maxval=1.),
+            'y': config.getfloat('observer_y_accel_sign', 1.,
+                                 minval=-1., maxval=1.),
+        }
+        if signs['x'] not in (-1., 1.) or signs['y'] not in (-1., 1.):
+            raise config.error(
+                "[trinkey_accel] observer acceleration signs must be -1 or 1")
+
+        self.ffi_main, self.ffi_lib = chelper.get_ffi()
+        for axis in ('x', 'y'):
+            prefix = 'observer_%s_' % (axis,)
+            state_count = config.getint(
+                prefix + 'state_count', minval=1, maxval=8)
+            fo = config.getfloatlist(
+                prefix + 'fo', count=state_count * state_count)
+            gu = config.getfloatlist(prefix + 'gu', count=state_count)
+            gv = config.getfloatlist(prefix + 'gv', count=state_count)
+            ga = config.getfloatlist(prefix + 'ga', count=state_count)
+            ho = config.getfloatlist(prefix + 'ho', count=state_count)
+            x0 = config.getfloatlist(
+                prefix + 'x0_per_mm', count=state_count)
+            observer = self.ffi_lib.state_space_observer_alloc(
+                state_count, fo, gu, gv, ga, ho, x0)
+            if observer == self.ffi_main.NULL:
+                raise config.error(
+                    "Invalid %s-axis state-space observer matrices"
+                    % (axis.upper(),))
+            self.observer_axes[axis] = {
+                'c': self.ffi_main.gc(
+                    observer, self.ffi_lib.state_space_observer_free),
+                'sign': signs[axis],
+                'sample_time': 1. / observer_rate,
+                'bias_samples': bias_samples,
+            }
+        self._reset_observers()
+
+    def _reset_observers(self):
+        """Discard state and repeat stationary bias calibration."""
+        for observer in self.observer_axes.values():
+            self.ffi_lib.state_space_observer_reset(observer['c'])
+            observer.update({
+                'bias_count': 0,
+                'bias_sum': 0.,
+                'bias': 0.,
+                'bias_ready': observer['bias_samples'] == 0,
+                'last_time': None,
+                'last_position': 0.,
+            })
+
+    def _handle_connect(self):
+        """Keep the generic kinematics used to invert final step positions."""
+        self.toolhead = self.printer.lookup_object('toolhead')
+        self.kinematics = self.toolhead.get_kinematics()
+        self.motion_steppers = self.kinematics.get_steppers()
+
+    def _get_commanded_position(self, print_time):
+        """Reconstruct final commanded XYZ from read-only step history."""
+        stepper_positions = {}
+        for stepper in self.motion_steppers:
+            mcu_position = stepper.get_past_mcu_position(print_time)
+            stepper_positions[stepper.get_name()] = (
+                stepper.mcu_to_commanded_position(mcu_position))
+        return self.kinematics.calc_position(stepper_positions)
+
+    def _reset_axis_state(self, observer):
+        """Reset dynamic state after a timing gap, retaining sensor bias."""
+        if observer['last_time'] is None:
+            return
+        self.ffi_lib.state_space_observer_reset(observer['c'])
+        observer['last_time'] = None
+        observer['last_position'] = 0.
+        self.observer_resets += 1
+
+    def _observe_axis(self, axis, print_time, position, measured_acceleration):
+        """Run one fixed-rate observer sample and return logged scalars."""
+        observer = self.observer_axes.get(axis)
+        if observer is None:
+            return 0., 0., 0., 0
+
+        acceleration = observer['sign'] * measured_acceleration
+        if not observer['bias_ready']:
+            observer['bias_sum'] += acceleration
+            observer['bias_count'] += 1
+            if observer['bias_count'] < observer['bias_samples']:
+                return 0., 0., 0., 0
+            observer['bias'] = (
+                observer['bias_sum'] / observer['bias_count'])
+            observer['bias_ready'] = True
+
+        corrected_acceleration = acceleration - observer['bias']
+        last_time = observer['last_time']
+        velocity = 0.
+        valid = 0
+        if last_time is not None:
+            sample_time = print_time - last_time
+            expected_time = observer['sample_time']
+            timing_error = abs(sample_time - expected_time) / expected_time
+            if sample_time <= 0. or timing_error > OBSERVER_TIME_TOLERANCE:
+                self._reset_axis_state(observer)
+                valid = 0
+            else:
+                velocity = (
+                    position - observer['last_position']) / sample_time
+                valid = 1
+
+        estimated_position = self.ffi_lib.state_space_observer_sample(
+            observer['c'], position, velocity, corrected_acceleration)
+        observer['last_time'] = print_time
+        observer['last_position'] = position
+        return velocity, estimated_position, corrected_acceleration, valid
 
     def _command_error(self, message):
         return self.printer.command_error(message)
@@ -438,6 +592,7 @@ class TrinkeyAccel:
 
     def _start_stream(self):
         self.clock_mapper.reset()
+        self._reset_observers()
         with self.data_lock:
             for queue in self.sample_queues.values():
                 queue.clear()
@@ -450,6 +605,8 @@ class TrinkeyAccel:
         self.packet_sequence_errors = 0
         self.last_packet_sequence = None
         self.read_errors = 0
+        self.observer_resets = 0
+        self.motion_lookup_errors = 0
         self.sync_timeouts = 0
         self.firmware_status = {}
         self._open_serial()
@@ -850,7 +1007,7 @@ class TrinkeyAccel:
             raise self._command_error(
                 "Toolhead TrapQ is unavailable for Trinkey reference data")
         moves, _cdata = toolhead_trapq.extract_trapq(start_time, end_time)
-        references = _sample_trapq_acceleration(moves, timed_keys)
+        references = _sample_trapq_motion(moves, timed_keys)
 
         current_print_time = self.mcu.estimated_print_time(eventtime)
         valid_after = current_print_time - TRAPQ_HISTORY_SAFE_AGE
@@ -859,17 +1016,56 @@ class TrinkeyAccel:
         for sensor, rows in mapped.items():
             output_rows = []
             command_axis = 1 if sensor == 'base' else 0
+            axis = 'y' if sensor == 'base' else 'x'
+            raw_axis = 1 if sensor == 'base' else 0
             for row_index, row in enumerate(rows):
                 (print_time, device_time_us, sequence,
                  x_raw, y_raw, z_raw, flags) = row
-                command = references[(sensor, row_index)][command_axis]
+                reference_position, reference_acceleration, reference_found = (
+                    references[(sensor, row_index)])
+                history_valid = print_time >= valid_after
+                motion_valid = history_valid and self.kinematics is not None
+                commanded_xyz = None
+                if motion_valid:
+                    try:
+                        commanded_xyz = self._get_commanded_position(print_time)
+                    except Exception:
+                        self.motion_lookup_errors += 1
+                        motion_valid = False
+                        if self.motion_lookup_errors == 1:
+                            logging.exception(
+                                "Unable to reconstruct commanded position at "
+                                "%.9f (further errors are counted in status)",
+                                print_time)
+
+                motor_position = 0.
+                motor_velocity = 0.
+                observed_position = 0.
+                observer_acceleration = 0.
+                observer_valid = 0
+                if motion_valid:
+                    motor_position = commanded_xyz[command_axis]
+                    raw_values = (x_raw, y_raw, z_raw)
+                    (motor_velocity, observed_position,
+                     observer_acceleration, observer_valid) = (
+                        self._observe_axis(
+                            axis, print_time, motor_position,
+                            raw_values[raw_axis] * scale))
+                elif axis in self.observer_axes:
+                    self._reset_axis_state(self.observer_axes[axis])
+
                 output_rows.append((
                     round(print_time, 9), device_time_us, sequence,
                     x_raw, y_raw, z_raw,
                     round(x_raw * scale, 6),
                     round(y_raw * scale, 6),
                     round(z_raw * scale, 6), flags,
-                    round(command, 6), int(print_time >= valid_after)))
+                    round(reference_position[command_axis], 6),
+                    round(reference_acceleration[command_axis], 6),
+                    round(motor_position, 6), round(motor_velocity, 6),
+                    round(observed_position, 6),
+                    round(observer_acceleration, 6), observer_valid,
+                    int(history_valid and reference_found)))
             data[sensor] = output_rows
 
         data.update({
@@ -880,6 +1076,8 @@ class TrinkeyAccel:
             'packet_sequence_errors': self.packet_sequence_errors,
             'sync_timeouts': self.sync_timeouts,
             'read_errors': self.read_errors,
+            'observer_resets': self.observer_resets,
+            'motion_lookup_errors': self.motion_lookup_errors,
         })
         return data
 
@@ -888,6 +1086,10 @@ class TrinkeyAccel:
             raise self._command_error(
                 "Unknown Trinkey accelerometer '%s'" % (sensor,))
         return self.sensor_dumps[sensor].start_internal_client()
+
+    def start_observer_client(self):
+        """Subscribe to the shared experiment/observer batches."""
+        return self.experiment_dump.start_internal_client()
 
     def is_streaming(self):
         return self.streaming or self.stream_clients > 0
@@ -907,7 +1109,9 @@ class TrinkeyAccel:
             'firmware_overruns', 'firmware_max_loop_us',
             'firmware_max_base_read_us',
             'firmware_max_toolhead_read_us', 'host_queue_drops',
-            'packet_sequence_errors', 'frame_errors', 'read_errors')
+            'packet_sequence_errors', 'frame_errors', 'read_errors',
+            'observer_enabled', 'observer_resets', 'motion_lookup_errors',
+            'observer_x_bias_ready', 'observer_y_bias_ready')
         fields = [
             '%s=%s' % (key, status[key])
             for key in keys if key in status]
@@ -944,7 +1148,14 @@ class TrinkeyAccel:
             'frame_errors': self.frame_errors,
             'packet_sequence_errors': self.packet_sequence_errors,
             'read_errors': self.read_errors,
+            'observer_enabled': bool(self.observer_axes),
+            'observer_resets': self.observer_resets,
+            'motion_lookup_errors': self.motion_lookup_errors,
         }
+        for axis, observer in self.observer_axes.items():
+            status['observer_%s_bias_ready' % (axis,)] = (
+                observer['bias_ready'])
+            status['observer_%s_bias' % (axis,)] = observer['bias']
         status.update(
             ('firmware_' + key, value)
             for key, value in self.firmware_status.items())

@@ -5,8 +5,10 @@ stock logger remains in `scripts/motan` and is unchanged.
 
 The lightweight logger records only:
 
-- base and toolhead Trinkey samples;
-- nominal toolhead acceleration evaluated at each genuine sensor timestamp;
+- raw base and toolhead Trinkey samples;
+- nominal TrapQ position and acceleration;
+- final motor position reconstructed from Klipper's step history; and
+- the shared state observer's position estimate and corrected acceleration;
 - a small status subset for run identification, print-time alignment, and
   acquisition diagnostics.
 
@@ -27,27 +29,35 @@ Run it before starting the print:
 ```sh
 python3 scripts/motan_lightweight/data_logger.py \
   /usr/data/printer_data/comms/klippy.sock \
-  /usr/data/printer_data/logs/motan/sine_35_comp_r1
+  /usr/data/printer_data/logs/motan/sine35_comp_r1
 ```
 
 Stop it with `Ctrl-C` after the print. It writes the standard Motan pair:
-`sine_35_comp_r1.json.gz` and `sine_35_comp_r1.index.gz`. The copied
+`sine35_comp_r1.json.gz` and `sine35_comp_r1.index.gz`. The copied
 `readlog.py`, `analyzers.py`, and `motan_graph.py` understand the same format.
 
 The principal datasets are:
 
 ```text
-trinkey_accel(toolhead,x)
-trinkey_accel(toolhead,command_x)
-trinkey_accel(base,y)
-trinkey_accel(base,command_y)
+trinkey_accel(toolhead,desired_position)
+trinkey_accel(toolhead,motor_position)
+trinkey_accel(toolhead,observed_position)
+trinkey_accel(base,desired_position)
+trinkey_accel(base,motor_position)
+trinkey_accel(base,observed_position)
 ```
 
-`command_x` and `command_y` are the nominal toolhead TrapQ accelerations at the
-timestamp of the corresponding physical sample. `reference_valid` is zero if
-a delayed sample is older than the conservative 25-second usable-history
-limit. Existing lightweight logs containing `trapq(toolhead,...)` remain
-readable.
+The `desired_*` values come from nominal toolhead TrapQ. The `motor_*` values
+come from the final generated step history, so they include any active FBF or
+input-shaper transformation and step quantisation. The `observed_*` position is
+the model-assisted estimate corrected by measured acceleration.
+
+`observer_valid` is zero during the initial 0.4-second stationary bias
+measurement and on a sample following a timing discontinuity. `reference_valid`
+is zero if a delayed sample is outside the conservative usable-history limit or
+has no matching TrapQ move. Keep the printer stationary for at least 0.4 s
+after starting the logger. The old `command_x` and `command_y` acceleration
+selectors remain available for earlier captures.
 
 Do not run stock Motan and this lightweight logger at the same time. They are
 separate capture modes backed by the same Trinkey stream.

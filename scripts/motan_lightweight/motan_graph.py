@@ -125,10 +125,12 @@ def main():
 
     # Default graphs to draw
     graph_descs = [
-        ["trinkey_accel(toolhead,command_x)?color=green",
-         "trinkey_accel(toolhead,x)?color=blue"],
-        ["trinkey_accel(base,command_y)?color=green",
-         "trinkey_accel(base,y)?color=blue"],
+        ["trinkey_accel(toolhead,desired_position)?color=green",
+         "trinkey_accel(toolhead,motor_position)?color=orange",
+         "trinkey_accel(toolhead,observed_position)?color=blue"],
+        ["trinkey_accel(base,desired_position)?color=green",
+         "trinkey_accel(base,motor_position)?color=orange",
+         "trinkey_accel(base,observed_position)?color=blue"],
     ]
     if options.graph is not None:
         graph_descs = ast.literal_eval(options.graph)

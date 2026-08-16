@@ -22,11 +22,12 @@ SOURCE_FILES = [
     'kin_cartesian.c', 'kin_corexy.c', 'kin_corexz.c', 'kin_delta.c',
     'kin_deltesian.c', 'kin_polar.c', 'kin_rotary_delta.c', 'kin_winch.c',
     'kin_extruder.c', 'kin_shaper.c', 'kin_filtered_bspline.c',
+    'state_space_observer.c',
 ]
 DEST_LIB = "c_helper.so"
 OTHER_FILES = [
     'list.h', 'serialqueue.h', 'stepcompress.h', 'itersolve.h', 'pyhelper.h',
-    'trapq.h', 'pollreactor.h', 'msgblock.h'
+    'trapq.h', 'pollreactor.h', 'msgblock.h', 'state_space_observer.h'
 ]
 
 defs_stepcompress = """
@@ -176,6 +177,17 @@ defs_kin_filtered_bspline = """
         struct stepper_kinematics *sk, double window);
 """
 
+defs_state_space_observer = """
+    struct state_space_observer *state_space_observer_alloc(
+        int state_count, double fo[], double gu[], double gv[], double ga[]
+        , double ho[], double x0_per_unit[]);
+    void state_space_observer_free(struct state_space_observer *observer);
+    void state_space_observer_reset(struct state_space_observer *observer);
+    double state_space_observer_sample(struct state_space_observer *observer
+        , double input_position, double input_velocity
+        , double measured_acceleration);
+"""
+
 defs_serialqueue = """
     #define MESSAGE_MAX 64
     struct pull_queue_message {
@@ -235,6 +247,7 @@ defs_all = [
     defs_kin_cartesian, defs_kin_corexy, defs_kin_corexz, defs_kin_delta,
     defs_kin_deltesian, defs_kin_polar, defs_kin_rotary_delta, defs_kin_winch,
     defs_kin_extruder, defs_kin_shaper, defs_kin_filtered_bspline,
+    defs_state_space_observer,
 ]
 
 # Update filenames to an absolute path
