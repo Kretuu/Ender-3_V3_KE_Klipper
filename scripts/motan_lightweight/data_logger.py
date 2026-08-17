@@ -98,6 +98,16 @@ class DataLogger:
         sys.stderr.write(msg + "\n")
     def finish(self, msg, status=0):
         self.error(msg)
+        # Notify Klipper that the streaming client is gone before potentially
+        # slow gzip finalization, so its STREAM_STOP handshake starts promptly.
+        try:
+            self.poll.unregister(self.webhook_socket)
+        except Exception:
+            pass
+        try:
+            self.webhook_socket.close()
+        except Exception:
+            pass
         self.logger.close()
         self.index.close()
         sys.exit(status)

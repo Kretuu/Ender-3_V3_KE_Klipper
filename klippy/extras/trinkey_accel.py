@@ -566,13 +566,19 @@ class TrinkeyAccel:
             response.extend(chunk)
             if len(response) > SERIAL_RECORD_LIMIT:
                 del response[:-SERIAL_RECORD_LIMIT]
-            match = ACK_STREAM_STOP_RE.search(
-                response.decode('utf-8', 'replace'))
+            response_text = response.decode('utf-8', 'replace')
+            match = ACK_STREAM_STOP_RE.search(response_text)
             if match is not None:
                 self.ack_stream_stop = match.group(0)
+                self.stream_stopped = True
                 self.serial_conn.reset_input_buffer()
                 return
-        raise self._command_error("Timed out putting Trinkey into idle mode")
+        response_text = response.decode('utf-8', 'replace')
+        response_text = ''.join(
+            char if char.isprintable() else '.' for char in response_text)
+        raise self._command_error(
+            "Timed out putting Trinkey into idle mode; response=%r"
+            % (response_text[-200:],))
 
     def _idle_sync_once(self):
         sequence = self.next_sync_sequence

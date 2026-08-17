@@ -61,6 +61,7 @@ class FilteredBSpline:
         self.observer_client = None
         self.hybrid_observation_errors = 0
         self.stepper_kinematics = []
+        self.original_stepper_kinematics = []
         self.printer.register_event_handler("klippy:connect", self._connect)
         self.printer.register_event_handler(
             "toolhead:set_position", self._handle_set_position)
@@ -133,6 +134,9 @@ class FilteredBSpline:
                 stepper.set_stepper_kinematics(original)
                 continue
             self.stepper_kinematics.append(wrapper)
+            # The C wrapper retains only the original kinematics' raw pointer.
+            # Keep its ffi.gc owner alive so it is not freed after replacement.
+            self.original_stepper_kinematics.append(original)
 
         if not self.stepper_kinematics:
             raise self.printer.config_error(
