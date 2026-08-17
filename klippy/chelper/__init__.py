@@ -21,13 +21,15 @@ SOURCE_FILES = [
     'pollreactor.c', 'msgblock.c', 'trdispatch.c',
     'kin_cartesian.c', 'kin_corexy.c', 'kin_corexz.c', 'kin_delta.c',
     'kin_deltesian.c', 'kin_polar.c', 'kin_rotary_delta.c', 'kin_winch.c',
-    'kin_extruder.c', 'kin_shaper.c', 'kin_filtered_bspline.c',
+    'kin_extruder.c', 'kin_shaper.c', 'filtered_bspline_core.c',
+    'filtered_bspline_hybrid.c', 'kin_filtered_bspline.c',
     'state_space_observer.c',
 ]
 DEST_LIB = "c_helper.so"
 OTHER_FILES = [
     'list.h', 'serialqueue.h', 'stepcompress.h', 'itersolve.h', 'pyhelper.h',
-    'trapq.h', 'pollreactor.h', 'msgblock.h', 'state_space_observer.h'
+    'trapq.h', 'pollreactor.h', 'msgblock.h',
+    'filtered_bspline_internal.h', 'state_space_observer.h'
 ]
 
 defs_stepcompress = """
@@ -163,8 +165,18 @@ defs_kin_filtered_bspline = """
         , int denominator_count, double denominator[]);
     int filtered_bspline_set_axis_limits(struct fbf_controller *controller
         , char axis, double position_min, double position_max);
+    int filtered_bspline_configure_hybrid(struct fbf_controller *controller
+        , double regularization, int warmup_samples);
+    int filtered_bspline_set_mode(struct fbf_controller *controller, int mode);
     void filtered_bspline_set_enabled(struct fbf_controller *controller
         , int enabled);
+    int filtered_bspline_add_observation(struct fbf_controller *controller
+        , char axis, double print_time, double observed_position);
+    int filtered_bspline_get_hybrid_status(
+        struct fbf_controller *controller, char axis, int *training_samples
+        , int *active, int *measurement_errors, int *solve_fallbacks
+        , int *hybrid_solves, int *prediction_gap_samples
+        , int *maximum_prediction_gap_samples, double *weight_norm);
     int filtered_bspline_prepare(struct fbf_controller *controller
         , struct trapq *tq, double start_time, double end_time, int is_final);
     int filtered_bspline_get_position(struct fbf_controller *controller

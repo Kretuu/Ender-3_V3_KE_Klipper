@@ -21,7 +21,9 @@ STATUS_OBJECTS = {
         'print_duration', 'filament_used'],
     'virtual_sdcard': [
         'file_path', 'progress', 'is_active', 'file_position', 'file_size'],
-    'filtered_bspline': ['enabled'],
+    'filtered_bspline': [
+        'enabled', 'mode', 'hybrid_observation_errors',
+        'hybrid_x', 'hybrid_y'],
     'toolhead': ['print_time', 'estimated_print_time', 'stalls'],
     'system_stats': ['sysload', 'cputime', 'memavail'],
     'trinkey_accel': None,

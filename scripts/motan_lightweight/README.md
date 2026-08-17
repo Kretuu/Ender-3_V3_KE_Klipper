@@ -10,7 +10,9 @@ The lightweight logger records only:
 - final motor position reconstructed from Klipper's step history; and
 - the shared state observer's position estimate and corrected acceleration;
 - a small status subset for run identification, print-time alignment, and
-  acquisition diagnostics.
+  acquisition diagnostics; and
+- the filtered B-spline mode and X/Y hybrid training, solve, delay, weight-norm,
+  and fallback status.
 
 It uses the custom `trinkey_accel/dump_experiment` endpoint and deliberately
 does not subscribe to the full toolhead or extruder TrapQ, step queues, ADXL345
@@ -35,6 +37,11 @@ python3 scripts/motan_lightweight/data_logger.py \
 Stop it with `Ctrl-C` after the print. It writes the standard Motan pair:
 `sine35_comp_r1.json.gz` and `sine35_comp_r1.index.gz`. The copied
 `readlog.py`, `analyzers.py`, and `motan_graph.py` understand the same format.
+
+For hybrid captures, use an unambiguous prefix such as
+`sine35_hybrid_r1`. The status stream records whether the learner passed its
+warm-up and whether hybrid preview solves actually occurred; the filename alone
+is not proof that hybrid compensation was active.
 
 The principal datasets are:
 

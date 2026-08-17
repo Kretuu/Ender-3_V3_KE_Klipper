@@ -16,6 +16,9 @@ BATCH_SAMPLES = 70
 PREVIEW_SAMPLES = 140
 IMPULSE_RESPONSE_SAMPLES = 20
 PREVIEW_TIME = SAMPLE_TIME * PREVIEW_SAMPLES
+HYBRID_NOMINAL_TERMS = 4
+HYBRID_RESIDUAL_TERMS = 50
+MODE_VALUES = {"standard": 1, "hybrid": 2}
 
 
 class FilteredBSpline:
@@ -24,6 +27,14 @@ class FilteredBSpline:
     def __init__(self, config):
         self.printer = config.get_printer()
         self.initial_enabled = config.getboolean("enabled", False)
+        self.initial_mode = config.getchoice(
+            "mode", {name: name for name in MODE_VALUES}, "standard")
+        self.hybrid_regularization = config.getfloat(
+            "hybrid_regularization", 0.01, above=0.)
+        self.hybrid_warmup_seconds = config.getfloat(
+            "hybrid_warmup_seconds", 5.5, minval=0.05)
+        self.hybrid_warmup_samples = int(round(
+            self.hybrid_warmup_seconds / SAMPLE_TIME))
         self.models = {
             axis: self._read_axis_model(config, axis) for axis in ("x", "y")
         }
@@ -39,18 +50,30 @@ class FilteredBSpline:
             controller, self.ffi_lib.filtered_bspline_controller_free)
         self._configure_models(config)
         self._configure_position_limits(config)
+        if self.ffi_lib.filtered_bspline_configure_hybrid(
+                self.controller, self.hybrid_regularization,
+                self.hybrid_warmup_samples):
+            raise config.error("Invalid hybrid FBF configuration")
 
         self.toolhead = None
         self.enabled = False
+        self.mode = self.initial_mode
+        self.observer_client = None
+        self.hybrid_observation_errors = 0
         self.stepper_kinematics = []
         self.printer.register_event_handler("klippy:connect", self._connect)
         self.printer.register_event_handler(
             "toolhead:set_position", self._handle_set_position)
+        self.printer.register_event_handler(
+            "klippy:disconnect", self._handle_disconnect)
 
         gcode = self.printer.lookup_object("gcode")
         gcode.register_command(
             "SET_FILTERED_BSPLINE", self.cmd_SET_FILTERED_BSPLINE,
             desc=self.cmd_SET_FILTERED_BSPLINE_help)
+        gcode.register_command(
+            "FILTERED_BSPLINE_STATUS", self.cmd_FILTERED_BSPLINE_STATUS,
+            desc=self.cmd_FILTERED_BSPLINE_STATUS_help)
 
     @staticmethod
     def _read_axis_model(config, axis):
@@ -116,10 +139,45 @@ class FilteredBSpline:
                 "filtered_bspline did not find an X or Y stepper")
         self.toolhead.register_motion_prepare_callback(self._prepare_motion)
         if self.initial_enabled:
-            self._set_enabled(True)
+            self._set_state(True, self.initial_mode)
+
+    def _start_observer_client(self):
+        """Subscribe to the one observer calculation shared with Motan."""
+        if self.observer_client is not None:
+            return
+        trinkey = self.printer.lookup_object("trinkey_accel", None)
+        if trinkey is None:
+            raise self.printer.command_error(
+                "Hybrid FBF requires a configured [trinkey_accel]")
+        self.observer_client = trinkey.start_observer_client()
+
+    def _stop_observer_client(self):
+        if self.observer_client is None:
+            return
+        self.observer_client.finalize()
+        self.observer_client = None
+
+    def _consume_observer_messages(self):
+        """Pass completed X/Y observer positions to the C learner."""
+        if self.observer_client is None:
+            return
+        # Experiment rows use the fixed schema published by trinkey_accel.py:
+        # time is column 0, observed position 14, observer_valid 16.
+        for message in self.observer_client.pop_messages():
+            params = message.get("params", {})
+            for sensor, axis in (("toolhead", "x"), ("base", "y")):
+                for row in params.get(sensor, ()):
+                    if len(row) <= 16 or not row[16]:
+                        continue
+                    result = self.ffi_lib.filtered_bspline_add_observation(
+                        self.controller, axis.encode(), row[0], row[14])
+                    if result < 0:
+                        self.hybrid_observation_errors += 1
 
     def _prepare_motion(self, start_time, end_time, is_final):
         """Solve every 70-sample batch with a complete 140-sample preview."""
+        if self.enabled and self.mode == "hybrid":
+            self._consume_observer_messages()
         result = self.ffi_lib.filtered_bspline_prepare(
             self.controller, self.toolhead.get_trapq(), start_time, end_time,
             is_final)
@@ -134,44 +192,124 @@ class FilteredBSpline:
         """Discard coefficients when homing or G92 changes the coordinates."""
         self.ffi_lib.filtered_bspline_controller_reset(self.controller)
 
-    def _set_enabled(self, enabled):
-        """Change controller state only after all old steps are flushed."""
-        if enabled == self.enabled:
+    def _handle_disconnect(self):
+        self._stop_observer_client()
+
+    def _set_state(self, enabled, mode):
+        """Change controller mode only after all old steps are flushed."""
+        if enabled == self.enabled and mode == self.mode:
+            return
+        if not enabled and not self.enabled:
+            self.mode = mode
             return
         old_delay = PREVIEW_TIME if self.enabled else 0.
         new_delay = PREVIEW_TIME if enabled else 0.
         self.toolhead.flush_step_generation()
+        if enabled and mode == "hybrid":
+            self._start_observer_client()
         self.toolhead.note_step_generation_scan_time(
             new_delay, old_delay=old_delay)
-        self.ffi_lib.filtered_bspline_set_enabled(self.controller, enabled)
+        c_mode = MODE_VALUES[mode] if enabled else 0
+        if self.ffi_lib.filtered_bspline_set_mode(self.controller, c_mode):
+            raise self.printer.command_error(
+                "Unable to change filtered B-spline mode")
         for wrapper in self.stepper_kinematics:
             # Include pre-action and settling outside nominal axis moves.
             self.ffi_lib.filtered_bspline_stepper_set_generation_window(
                 wrapper, new_delay)
         self.enabled = enabled
+        self.mode = mode
+        # Keep the completed run's diagnostics visible after ENABLE=0.  A new
+        # enabled run starts a fresh count, matching the C learner reset at
+        # trajectory initialization.
+        if enabled:
+            self.hybrid_observation_errors = 0
+        if not enabled or mode != "hybrid":
+            self._stop_observer_client()
 
     cmd_SET_FILTERED_BSPLINE_help = (
-        "Enable or disable limited-preview filtered B-spline feedforward")
+        "Select and enable standard or hybrid filtered B-spline feedforward")
 
     def cmd_SET_FILTERED_BSPLINE(self, gcmd):
-        """Handle SET_FILTERED_BSPLINE ENABLE=0|1."""
+        """Handle ENABLE=0|1 MODE=STANDARD|HYBRID."""
         enabled = bool(gcmd.get_int(
             "ENABLE", int(self.enabled), minval=0, maxval=1))
-        self._set_enabled(enabled)
+        mode = gcmd.get("MODE", self.mode).lower()
+        if mode not in MODE_VALUES:
+            raise gcmd.error("MODE must be STANDARD or HYBRID")
+        self._set_state(enabled, mode)
         gcmd.respond_info(
-            "filtered_bspline enabled:%d sample_time:%.4f preview_time:%.3f"
-            % (self.enabled, SAMPLE_TIME, PREVIEW_TIME))
+            "filtered_bspline enabled:%d mode:%s sample_time:%.4f "
+            "preview_time:%.3f"
+            % (self.enabled, self.mode, SAMPLE_TIME, PREVIEW_TIME))
+
+    def _get_hybrid_axis_status(self, axis):
+        training_samples = self.ffi_main.new("int *")
+        active = self.ffi_main.new("int *")
+        measurement_errors = self.ffi_main.new("int *")
+        solve_fallbacks = self.ffi_main.new("int *")
+        hybrid_solves = self.ffi_main.new("int *")
+        prediction_gap_samples = self.ffi_main.new("int *")
+        maximum_prediction_gap_samples = self.ffi_main.new("int *")
+        weight_norm = self.ffi_main.new("double *")
+        self.ffi_lib.filtered_bspline_get_hybrid_status(
+            self.controller, axis.encode(), training_samples, active,
+            measurement_errors, solve_fallbacks, hybrid_solves,
+            prediction_gap_samples, maximum_prediction_gap_samples,
+            weight_norm)
+        return collections.OrderedDict([
+            ("training_samples", training_samples[0]),
+            ("active", bool(active[0])),
+            ("measurement_errors", measurement_errors[0]),
+            ("solve_fallbacks", solve_fallbacks[0]),
+            ("hybrid_solves", hybrid_solves[0]),
+            ("prediction_gap_samples", prediction_gap_samples[0]),
+            ("maximum_prediction_gap_samples",
+             maximum_prediction_gap_samples[0]),
+            ("weight_norm", weight_norm[0]),
+        ])
+
+    cmd_FILTERED_BSPLINE_STATUS_help = (
+        "Report standard/hybrid filtered B-spline controller state")
+
+    def cmd_FILTERED_BSPLINE_STATUS(self, gcmd):
+        lines = ["filtered_bspline enabled:%d mode:%s" % (
+            self.enabled, self.mode)]
+        for axis in ("x", "y"):
+            status = self._get_hybrid_axis_status(axis)
+            lines.append(
+                "%s training:%d active:%d hybrid_solves:%d "
+                "gap_samples:%d max_gap_samples:%d "
+                "measurement_errors:%d solve_fallbacks:%d "
+                "weight_norm:%.6g" % (
+                    axis, status["training_samples"], status["active"],
+                    status["hybrid_solves"],
+                    status["prediction_gap_samples"],
+                    status["maximum_prediction_gap_samples"],
+                    status["measurement_errors"],
+                    status["solve_fallbacks"], status["weight_norm"]))
+        lines.append("python_observation_errors:%d" % (
+            self.hybrid_observation_errors,))
+        gcmd.respond_info("\n".join(lines))
 
     def get_status(self, eventtime):
         """Expose the fixed experimental design through Klipper status."""
         return collections.OrderedDict([
             ("enabled", self.enabled),
+            ("mode", self.mode),
             ("sample_time", SAMPLE_TIME),
             ("degree", B_SPLINE_DEGREE),
             ("knot_spacing_samples", KNOT_SPACING_SAMPLES),
             ("batch_samples", BATCH_SAMPLES),
             ("preview_samples", PREVIEW_SAMPLES),
             ("impulse_response_samples", IMPULSE_RESPONSE_SAMPLES),
+            ("hybrid_nominal_terms", HYBRID_NOMINAL_TERMS),
+            ("hybrid_residual_terms", HYBRID_RESIDUAL_TERMS),
+            ("hybrid_regularization", self.hybrid_regularization),
+            ("hybrid_warmup_seconds", self.hybrid_warmup_seconds),
+            ("hybrid_observation_errors", self.hybrid_observation_errors),
+            ("hybrid_x", self._get_hybrid_axis_status("x")),
+            ("hybrid_y", self._get_hybrid_axis_status("y")),
         ])
 
 
