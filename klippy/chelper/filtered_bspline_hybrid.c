@@ -111,16 +111,26 @@ fbf_hybrid_train_residual_sample(struct fbf_axis *axis, double nominal,
     for (index = 0; index < HYBRID_FEATURES; index++)
         predicted += learner->weights[index] * feature[index];
     double prediction_error = residual - predicted;
+    double inverse_denominator = 1. / denominator;
+    double gain[HYBRID_FEATURES];
     // w(k)=w(k-1)+P*phi/(1+phi^T*P*phi)*prediction_error.
-    for (index = 0; index < HYBRID_FEATURES; index++)
+    for (index = 0; index < HYBRID_FEATURES; index++) {
+        gain[index] = p_feature[index] * inverse_denominator;
         learner->weights[index]
-            += p_feature[index] / denominator * prediction_error;
+            += gain[index] * prediction_error;
+    }
 
     // P(k)=P(k-1)-(P*phi*phi^T*P)/(1+phi^T*P*phi).
-    for (row = 0; row < HYBRID_FEATURES; row++)
-        for (column = 0; column < HYBRID_FEATURES; column++)
-            learner->covariance[row][column]
-                -= p_feature[row] * p_feature[column] / denominator;
+    // P starts symmetric and this rank-one update preserves symmetry.  Update
+    // one triangle and mirror it instead of calculating both halves.
+    for (row = 0; row < HYBRID_FEATURES; row++) {
+        for (column = row; column < HYBRID_FEATURES; column++) {
+            double value = learner->covariance[row][column]
+                - gain[row] * p_feature[column];
+            learner->covariance[row][column] = value;
+            learner->covariance[column][row] = value;
+        }
+    }
 
     // Advance phi(k)'s histories so this sample is "past" at k+1.
     shift_scalar_history(learner->nominal_history,
@@ -138,15 +148,36 @@ fbf_hybrid_lookup_nominal_prediction(struct fbf_controller *controller,
                                      int axis_index, double print_time,
                                      double *nominal)
 {
-    struct fbf_batch *batch;
-    list_for_each_entry(batch, &controller->batches, node) {
+    struct list_node *node = controller->batches.root.next;
+    struct fbf_batch *cached = controller->nominal_cache[axis_index];
+    if (cached) {
+        double cached_time = print_time - cached->start_time;
+        if (cached_time >= -FBF_TIME_EPSILON
+            && cached_time < FBF_BATCH_TIME - FBF_TIME_EPSILON) {
+            long sample = llround(cached_time / FBF_SAMPLE_TIME);
+            if (sample >= 0 && sample < FBF_BATCH_SAMPLES
+                && fabs(cached_time - sample * FBF_SAMPLE_TIME) <= 1.0e-6) {
+                *nominal = cached->nominal[axis_index][sample];
+                return 0;
+            }
+        }
+        if (print_time >= cached->start_time)
+            node = cached->node.next;
+    }
+    while (node != &controller->batches.root) {
+        struct fbf_batch *batch = container_of(
+            node, struct fbf_batch, node);
         double relative_time = print_time - batch->start_time;
         long sample = llround(relative_time / FBF_SAMPLE_TIME);
-        if (sample < 0 || sample >= FBF_BATCH_SAMPLES
-            || fabs(relative_time - sample * FBF_SAMPLE_TIME) > 1.0e-6)
-            continue;
-        *nominal = batch->nominal[axis_index][sample];
-        return 0;
+        if (sample >= 0 && sample < FBF_BATCH_SAMPLES
+            && fabs(relative_time - sample * FBF_SAMPLE_TIME) <= 1.0e-6) {
+            controller->nominal_cache[axis_index] = batch;
+            *nominal = batch->nominal[axis_index][sample];
+            return 0;
+        }
+        if (relative_time < 0.)
+            break;
+        node = node->next;
     }
     return -1;
 }

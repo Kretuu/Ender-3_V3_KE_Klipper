@@ -40,16 +40,31 @@ static void
 sample_desired_window(struct trapq *tq, double start_time,
                       double desired[FBF_AXIS_COUNT][FBF_PREVIEW_SAMPLES])
 {
+    // Preview times are monotonic.  Walk TrapQ once instead of restarting at
+    // its head for every one of the 140 samples.
+    trapq_check_sentinels(tq);
+    struct move *head = list_first_entry(&tq->moves, struct move, node);
+    struct move *tail = list_last_entry(&tq->moves, struct move, node);
+    struct move *move = list_next_entry(head, node);
     int sample;
     for (sample = 0; sample < FBF_PREVIEW_SAMPLES; sample++) {
-        struct coord position = get_desired_position(
-            tq, start_time + sample * FBF_SAMPLE_TIME);
+        double print_time = start_time + sample * FBF_SAMPLE_TIME;
+        while (move != tail
+               && print_time >= move->print_time + move->move_t)
+            move = list_next_entry(move, node);
+        struct coord position;
+        if (move == tail)
+            position = tail->start_pos;
+        else if (print_time <= move->print_time)
+            position = move->start_pos;
+        else
+            position = move_get_coord(move, print_time - move->print_time);
         desired[0][sample] = position.x;
         desired[1][sample] = position.y;
     }
 }
 
-/** Remove batches only after command generation and hybrid training pass them. */
+/** Remove batches after command generation and hybrid training pass them. */
 static void
 discard_old_batches(struct fbf_controller *controller, double start_time)
 {
@@ -74,6 +89,10 @@ discard_old_batches(struct fbf_controller *controller, double start_time)
             &controller->batches, struct fbf_batch, node);
         if (batch->start_time + FBF_BATCH_TIME >= discard_before)
             break;
+        int axis_index;
+        for (axis_index = 0; axis_index < FBF_AXIS_COUNT; axis_index++)
+            if (controller->nominal_cache[axis_index] == batch)
+                controller->nominal_cache[axis_index] = NULL;
         list_del(&batch->node);
         free(batch);
     }
@@ -170,6 +189,7 @@ filtered_bspline_controller_alloc(void)
     if (!controller)
         return NULL;
     memset(controller, 0, sizeof(*controller));
+    controller->generation = 1;
     controller->hybrid_regularization = 0.01;
     controller->hybrid_warmup_samples = 5500;
     list_init(&controller->batches);
@@ -179,6 +199,7 @@ filtered_bspline_controller_alloc(void)
 void __visible
 filtered_bspline_controller_reset(struct fbf_controller *controller)
 {
+    memset(controller->nominal_cache, 0, sizeof(controller->nominal_cache));
     while (!list_empty(&controller->batches)) {
         struct fbf_batch *batch = list_first_entry(
             &controller->batches, struct fbf_batch, node);
@@ -186,6 +207,7 @@ filtered_bspline_controller_reset(struct fbf_controller *controller)
         free(batch);
     }
     controller->initialized = 0;
+    controller->generation++;
     // A new trajectory resets the numerical learner state.  Keep the previous
     // run's counters visible between ENABLE=0 and the next trajectory.
 }
@@ -423,6 +445,30 @@ get_prepared_position(struct fbf_controller *controller, int axis_index,
     return -1;
 }
 
+static int
+get_cached_position(double start_time, double samples[], double print_time,
+                    double *position)
+{
+    double relative_time = print_time - start_time;
+    if (relative_time < -FBF_TIME_EPSILON
+        || relative_time > FBF_BATCH_TIME + FBF_TIME_EPSILON)
+        return -1;
+    double sample_position = relative_time / FBF_SAMPLE_TIME;
+    if (sample_position <= 0.) {
+        *position = samples[0];
+        return 0;
+    }
+    if (sample_position >= FBF_BATCH_SAMPLES) {
+        *position = samples[FBF_BATCH_SAMPLES];
+        return 0;
+    }
+    int sample = floor(sample_position);
+    double fraction = sample_position - sample;
+    *position = samples[sample]
+        + fraction * (samples[sample + 1] - samples[sample]);
+    return 0;
+}
+
 int __visible
 filtered_bspline_get_position(struct fbf_controller *controller, char axis,
                               double print_time, double *position)
@@ -445,7 +491,33 @@ struct filtered_bspline_stepper {
     struct stepper_kinematics *orig_sk;
     struct fbf_controller *controller;
     struct move dummy_move;
+    unsigned int cached_generation;
+    int cache_valid;
+    double cached_start_time;
+    double cached_position[FBF_AXIS_COUNT][FBF_BATCH_SAMPLES + 1];
 };
+
+static int
+cache_prepared_batch(struct filtered_bspline_stepper *wrapper,
+                     double print_time)
+{
+    struct fbf_controller *controller = wrapper->controller;
+    struct fbf_batch *batch;
+    list_for_each_entry(batch, &controller->batches, node) {
+        double relative_time = print_time - batch->start_time;
+        if (relative_time < -FBF_TIME_EPSILON
+            || relative_time > FBF_BATCH_TIME + FBF_TIME_EPSILON)
+            continue;
+        wrapper->cached_start_time = batch->start_time;
+        memcpy(wrapper->cached_position, batch->position,
+               sizeof(wrapper->cached_position));
+        wrapper->cached_generation = controller->generation;
+        wrapper->cache_valid = 1;
+        return 0;
+    }
+    wrapper->cache_valid = 0;
+    return -1;
+}
 
 static double
 filtered_bspline_calc_position(struct stepper_kinematics *sk,
@@ -460,13 +532,23 @@ filtered_bspline_calc_position(struct stepper_kinematics *sk,
 
     struct coord position = move_get_coord(move, move_time);
     double print_time = move->print_time + move_time;
+    if (!wrapper->cache_valid
+        || wrapper->cached_generation != controller->generation
+        || print_time < wrapper->cached_start_time - FBF_TIME_EPSILON
+        || print_time > wrapper->cached_start_time + FBF_BATCH_TIME
+                        + FBF_TIME_EPSILON)
+        cache_prepared_batch(wrapper, print_time);
     int found = 0;
-    if (sk->active_flags & AF_X)
-        found |= !get_prepared_position(
-            controller, 0, print_time, &position.x);
-    if (sk->active_flags & AF_Y)
-        found |= !get_prepared_position(
-            controller, 1, print_time, &position.y);
+    if (wrapper->cache_valid) {
+        if (sk->active_flags & AF_X)
+            found |= !get_cached_position(
+                wrapper->cached_start_time, wrapper->cached_position[0],
+                print_time, &position.x);
+        if (sk->active_flags & AF_Y)
+            found |= !get_cached_position(
+                wrapper->cached_start_time, wrapper->cached_position[1],
+                print_time, &position.y);
+    }
     if (!found)
         return wrapper->orig_sk->calc_position_cb(
             wrapper->orig_sk, move, move_time);

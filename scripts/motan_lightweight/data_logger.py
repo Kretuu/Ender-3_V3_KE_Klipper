@@ -23,6 +23,8 @@ STATUS_OBJECTS = {
         'file_path', 'progress', 'is_active', 'file_position', 'file_size'],
     'filtered_bspline': [
         'enabled', 'mode', 'hybrid_observation_errors',
+        'hybrid_worker_queue', 'hybrid_worker_queue_max',
+        'hybrid_worker_drops', 'hybrid_worker_alive',
         'hybrid_x', 'hybrid_y'],
     'toolhead': ['print_time', 'estimated_print_time', 'stalls'],
     'system_stats': ['sysload', 'cputime', 'memavail'],

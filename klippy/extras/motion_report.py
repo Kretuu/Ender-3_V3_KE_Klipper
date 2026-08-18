@@ -58,8 +58,9 @@ class APIDumpHelper:
         template = web_request.get_dict('response_template', {})
         self.clients[cconn] = template
         self._start()
-    def add_internal_client(self):
-        cconn = InternalDumpClient()
+    def add_internal_client(self, message_cb=None):
+        """Add either a queued client or an immediate in-process consumer."""
+        cconn = InternalDumpClient(message_cb)
         self.clients[cconn] = {}
         self._start()
         return cconn
@@ -94,8 +95,11 @@ class APIDumpHelper:
 
 # An "internal webhooks" wrapper for using APIDumpHelper internally
 class InternalDumpClient:
-    def __init__(self):
+    """Queue dump messages, or deliver them to an optional callback."""
+
+    def __init__(self, message_cb=None):
         self.msgs = []
+        self.message_cb = message_cb
         self.is_done = False
     def get_messages(self):
         return self.msgs
@@ -109,6 +113,9 @@ class InternalDumpClient:
     def is_closed(self):
         return self.is_done
     def send(self, msg):
+        if self.message_cb is not None:
+            self.message_cb(msg)
+            return
         self.msgs.append(msg)
         if len(self.msgs) >= 10000:
             # Avoid filling up memory with too many samples

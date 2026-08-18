@@ -1,7 +1,7 @@
 # Lightweight Motan logger
 
-This is a separate Motan variant for the dissertation acceleration prints. The
-stock logger remains in `scripts/motan` and is unchanged.
+This is the supported Motan variant for the dissertation acceleration prints.
+The stock logger remains generic and does not subscribe to the Trinkey stream.
 
 The lightweight logger records only:
 
@@ -63,11 +63,7 @@ the model-assisted estimate corrected by measured acceleration.
 measurement and on a sample following a timing discontinuity. `reference_valid`
 is zero if a delayed sample is outside the conservative usable-history limit or
 has no matching TrapQ move. Keep the printer stationary for at least 0.4 s
-after starting the logger. The old `command_x` and `command_y` acceleration
-selectors remain available for earlier captures.
-
-Do not run stock Motan and this lightweight logger at the same time. They are
-separate capture modes backed by the same Trinkey stream.
+after starting the logger.
 
 Use a unique log prefix for every run. The logger opens output files in write
 mode and will replace files that already have the same prefix.

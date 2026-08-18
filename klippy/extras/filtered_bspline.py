@@ -5,6 +5,8 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 import collections
+import logging
+import threading
 import chelper
 
 
@@ -18,6 +20,10 @@ IMPULSE_RESPONSE_SAMPLES = 20
 PREVIEW_TIME = SAMPLE_TIME * PREVIEW_SAMPLES
 HYBRID_NOMINAL_TERMS = 4
 HYBRID_RESIDUAL_TERMS = 50
+HYBRID_WORK_QUEUE_LIMIT = 4096
+EXPERIMENT_TIME_INDEX = 0
+EXPERIMENT_OBSERVED_POSITION_INDEX = 14
+EXPERIMENT_OBSERVER_VALID_INDEX = 16
 MODE_VALUES = {"standard": 1, "hybrid": 2}
 
 
@@ -60,6 +66,13 @@ class FilteredBSpline:
         self.mode = self.initial_mode
         self.observer_client = None
         self.hybrid_observation_errors = 0
+        self.hybrid_worker_drops = 0
+        self.hybrid_worker_queue_max = 0
+        self.hybrid_work = collections.deque()
+        self.hybrid_work_condition = threading.Condition()
+        self.hybrid_controller_lock = threading.Lock()
+        self.hybrid_worker = None
+        self.hybrid_worker_running = False
         self.stepper_kinematics = []
         self.original_stepper_kinematics = []
         self.printer.register_event_handler("klippy:connect", self._connect)
@@ -75,6 +88,10 @@ class FilteredBSpline:
         gcode.register_command(
             "FILTERED_BSPLINE_STATUS", self.cmd_FILTERED_BSPLINE_STATUS,
             desc=self.cmd_FILTERED_BSPLINE_STATUS_help)
+        gcode.register_command(
+            "WAIT_FILTERED_BSPLINE_READY",
+            self.cmd_WAIT_FILTERED_BSPLINE_READY,
+            desc=self.cmd_WAIT_FILTERED_BSPLINE_READY_help)
 
     @staticmethod
     def _read_axis_model(config, axis):
@@ -153,38 +170,117 @@ class FilteredBSpline:
         if trinkey is None:
             raise self.printer.command_error(
                 "Hybrid FBF requires a configured [trinkey_accel]")
-        self.observer_client = trinkey.start_observer_client()
+        self._start_hybrid_worker()
+        try:
+            self.observer_client = trinkey.start_observer_client(
+                self._handle_observer_message)
+        except Exception:
+            self._stop_hybrid_worker()
+            raise
 
     def _stop_observer_client(self):
         if self.observer_client is None:
+            self._stop_hybrid_worker()
             return
         self.observer_client.finalize()
         self.observer_client = None
+        self._stop_hybrid_worker()
 
-    def _consume_observer_messages(self):
-        """Pass completed X/Y observer positions to the C learner."""
-        if self.observer_client is None:
+    def _handle_observer_message(self, message):
+        """Immediately hand one completed observer batch to the RLS worker."""
+        work = []
+        params = message.get("params", {})
+        for sensor, axis in (("toolhead", "x"), ("base", "y")):
+            for row in params.get(sensor, ()):
+                if (len(row) <= EXPERIMENT_OBSERVER_VALID_INDEX
+                        or not row[EXPERIMENT_OBSERVER_VALID_INDEX]):
+                    continue
+                work.append((
+                    axis.encode(), row[EXPERIMENT_TIME_INDEX],
+                    row[EXPERIMENT_OBSERVED_POSITION_INDEX]))
+        self._enqueue_observer_work(work)
+
+    def _enqueue_observer_work(self, work):
+        if not work:
             return
-        # Experiment rows use the fixed schema published by trinkey_accel.py:
-        # time is column 0, observed position 14, observer_valid 16.
-        for message in self.observer_client.pop_messages():
-            params = message.get("params", {})
-            for sensor, axis in (("toolhead", "x"), ("base", "y")):
-                for row in params.get(sensor, ()):
-                    if len(row) <= 16 or not row[16]:
-                        continue
+        with self.hybrid_work_condition:
+            if not self.hybrid_worker_running:
+                return
+            overflow = (len(self.hybrid_work) + len(work)
+                        - HYBRID_WORK_QUEUE_LIMIT)
+            if overflow > 0:
+                drop_count = min(overflow, len(self.hybrid_work))
+                for unused in range(drop_count):
+                    self.hybrid_work.popleft()
+                overflow -= drop_count
+                if overflow > 0:
+                    work = work[overflow:]
+                    drop_count += overflow
+                self.hybrid_worker_drops += drop_count
+            self.hybrid_work.extend(work)
+            if len(self.hybrid_work) > self.hybrid_worker_queue_max:
+                self.hybrid_worker_queue_max = len(self.hybrid_work)
+            self.hybrid_work_condition.notify()
+
+    def _start_hybrid_worker(self):
+        if self.hybrid_worker is not None:
+            if self.hybrid_worker.is_alive():
+                return
+            self.hybrid_worker = None
+        with self.hybrid_work_condition:
+            self.hybrid_work.clear()
+            self.hybrid_worker_running = True
+        self.hybrid_worker = threading.Thread(
+            target=self._hybrid_worker_loop,
+            name="filtered-bspline-learner")
+        self.hybrid_worker.daemon = True
+        self.hybrid_worker.start()
+
+    def _stop_hybrid_worker(self):
+        worker = self.hybrid_worker
+        if worker is None:
+            return
+        with self.hybrid_work_condition:
+            self.hybrid_worker_running = False
+            self.hybrid_work.clear()
+            self.hybrid_work_condition.notify_all()
+        worker.join(1.0)
+        if worker.is_alive():
+            logging.warning("Filtered B-spline learner did not stop promptly")
+        else:
+            self.hybrid_worker = None
+
+    def _hybrid_worker_loop(self):
+        """Train RLS off-reactor while serializing mutable controller access."""
+        while True:
+            with self.hybrid_work_condition:
+                while (self.hybrid_worker_running
+                       and not self.hybrid_work):
+                    self.hybrid_work_condition.wait()
+                if not self.hybrid_worker_running:
+                    return
+                axis, print_time, observed_position = self.hybrid_work.popleft()
+            try:
+                # One observation performs at most four 1 kHz updates.  Taking
+                # the lock per observation bounds reactor contention while the
+                # CFFI call executes on a worker-capable native thread.
+                with self.hybrid_controller_lock:
                     result = self.ffi_lib.filtered_bspline_add_observation(
-                        self.controller, axis.encode(), row[0], row[14])
-                    if result < 0:
-                        self.hybrid_observation_errors += 1
+                        self.controller, axis, print_time, observed_position)
+                if result < 0:
+                    self.hybrid_observation_errors += 1
+            except Exception:
+                self.hybrid_observation_errors += 1
+                logging.exception("Filtered B-spline learner update failed")
 
     def _prepare_motion(self, start_time, end_time, is_final):
         """Solve every 70-sample batch with a complete 140-sample preview."""
-        if self.enabled and self.mode == "hybrid":
-            self._consume_observer_messages()
-        result = self.ffi_lib.filtered_bspline_prepare(
-            self.controller, self.toolhead.get_trapq(), start_time, end_time,
-            is_final)
+        # The worker never touches TrapQ.  This lock only prevents it from
+        # reading controller batches while prepare mutates or discards them.
+        with self.hybrid_controller_lock:
+            result = self.ffi_lib.filtered_bspline_prepare(
+                self.controller, self.toolhead.get_trapq(), start_time,
+                end_time, is_final)
         if result == -2:
             raise self.printer.command_error(
                 "Filtered B-spline motion exceeds an axis travel limit")
@@ -194,7 +290,10 @@ class FilteredBSpline:
 
     def _handle_set_position(self):
         """Discard coefficients when homing or G92 changes the coordinates."""
-        self.ffi_lib.filtered_bspline_controller_reset(self.controller)
+        with self.hybrid_controller_lock:
+            self.ffi_lib.filtered_bspline_controller_reset(self.controller)
+        with self.hybrid_work_condition:
+            self.hybrid_work.clear()
 
     def _handle_disconnect(self):
         self._stop_observer_client()
@@ -214,9 +313,11 @@ class FilteredBSpline:
         self.toolhead.note_step_generation_scan_time(
             new_delay, old_delay=old_delay)
         c_mode = MODE_VALUES[mode] if enabled else 0
-        if self.ffi_lib.filtered_bspline_set_mode(self.controller, c_mode):
-            raise self.printer.command_error(
-                "Unable to change filtered B-spline mode")
+        with self.hybrid_controller_lock:
+            if self.ffi_lib.filtered_bspline_set_mode(
+                    self.controller, c_mode):
+                raise self.printer.command_error(
+                    "Unable to change filtered B-spline mode")
         for wrapper in self.stepper_kinematics:
             # Include pre-action and settling outside nominal axis moves.
             self.ffi_lib.filtered_bspline_stepper_set_generation_window(
@@ -228,6 +329,8 @@ class FilteredBSpline:
         # trajectory initialization.
         if enabled:
             self.hybrid_observation_errors = 0
+            self.hybrid_worker_drops = 0
+            self.hybrid_worker_queue_max = 0
         if not enabled or mode != "hybrid":
             self._stop_observer_client()
 
@@ -256,11 +359,12 @@ class FilteredBSpline:
         prediction_gap_samples = self.ffi_main.new("int *")
         maximum_prediction_gap_samples = self.ffi_main.new("int *")
         weight_norm = self.ffi_main.new("double *")
-        self.ffi_lib.filtered_bspline_get_hybrid_status(
-            self.controller, axis.encode(), training_samples, active,
-            measurement_errors, solve_fallbacks, hybrid_solves,
-            prediction_gap_samples, maximum_prediction_gap_samples,
-            weight_norm)
+        with self.hybrid_controller_lock:
+            self.ffi_lib.filtered_bspline_get_hybrid_status(
+                self.controller, axis.encode(), training_samples, active,
+                measurement_errors, solve_fallbacks, hybrid_solves,
+                prediction_gap_samples, maximum_prediction_gap_samples,
+                weight_norm)
         return collections.OrderedDict([
             ("training_samples", training_samples[0]),
             ("active", bool(active[0])),
@@ -294,7 +398,42 @@ class FilteredBSpline:
                     status["solve_fallbacks"], status["weight_norm"]))
         lines.append("python_observation_errors:%d" % (
             self.hybrid_observation_errors,))
+        lines.append(
+            "worker_queue:%d worker_queue_max:%d worker_drops:%d "
+            "worker_alive:%d" % (
+            len(self.hybrid_work), self.hybrid_worker_queue_max,
+            self.hybrid_worker_drops,
+            self.hybrid_worker is not None and self.hybrid_worker.is_alive()))
         gcmd.respond_info("\n".join(lines))
+
+    cmd_WAIT_FILTERED_BSPLINE_READY_help = (
+        "Wait until both hybrid residual learners complete warm-up")
+
+    def cmd_WAIT_FILTERED_BSPLINE_READY(self, gcmd):
+        if not self.enabled or self.mode != "hybrid":
+            raise gcmd.error(
+                "WAIT_FILTERED_BSPLINE_READY requires enabled hybrid mode")
+        timeout = gcmd.get_float("TIMEOUT", 2., above=0.)
+        reactor = self.printer.get_reactor()
+        deadline = reactor.monotonic() + timeout
+        while True:
+            x_status = self._get_hybrid_axis_status("x")
+            y_status = self._get_hybrid_axis_status("y")
+            if x_status["active"] and y_status["active"]:
+                gcmd.respond_info(
+                    "Hybrid FBF ready: x_training:%d y_training:%d"
+                    % (x_status["training_samples"],
+                       y_status["training_samples"]))
+                return
+            eventtime = reactor.monotonic()
+            if eventtime >= deadline:
+                raise gcmd.error(
+                    "Hybrid FBF warm-up timed out: x_training:%d "
+                    "y_training:%d required:%d"
+                    % (x_status["training_samples"],
+                       y_status["training_samples"],
+                       self.hybrid_warmup_samples))
+            reactor.pause(min(deadline, eventtime + .050))
 
     def get_status(self, eventtime):
         """Expose the fixed experimental design through Klipper status."""
@@ -312,6 +451,11 @@ class FilteredBSpline:
             ("hybrid_regularization", self.hybrid_regularization),
             ("hybrid_warmup_seconds", self.hybrid_warmup_seconds),
             ("hybrid_observation_errors", self.hybrid_observation_errors),
+            ("hybrid_worker_queue", len(self.hybrid_work)),
+            ("hybrid_worker_queue_max", self.hybrid_worker_queue_max),
+            ("hybrid_worker_drops", self.hybrid_worker_drops),
+            ("hybrid_worker_alive", self.hybrid_worker is not None
+             and self.hybrid_worker.is_alive()),
             ("hybrid_x", self._get_hybrid_axis_status("x")),
             ("hybrid_y", self._get_hybrid_axis_status("y")),
         ])

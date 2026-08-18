@@ -181,41 +181,8 @@ class TrinkeyClockMapper:
         }
 
 
-class TrinkeySensorDump:
-    def __init__(self, parent, sensor, update_interval):
-        self.parent = parent
-        self.sensor = sensor
-        self.api_dump = motion_report.APIDumpHelper(
-            parent.printer, self._api_update, self._api_startstop,
-            update_interval)
-        webhooks = parent.printer.lookup_object('webhooks')
-        webhooks.register_mux_endpoint(
-            'trinkey_accel/dump_trinkey_accel', 'sensor', sensor,
-            self._handle_dump)
-
-    def _api_startstop(self, is_start):
-        if is_start:
-            self.parent.add_stream_client()
-        else:
-            self.parent.remove_stream_client()
-
-    def _api_update(self, eventtime):
-        return self.parent.api_update(self.sensor, eventtime)
-
-    def _handle_dump(self, web_request):
-        self.api_dump.add_client(web_request)
-        header = (
-            'time', 'device_time_us', 'sample_sequence',
-            'x_raw', 'y_raw', 'z_raw',
-            'x_acceleration', 'y_acceleration', 'z_acceleration', 'flags')
-        web_request.send({'header': header})
-
-    def start_internal_client(self):
-        return self.api_dump.add_internal_client()
-
-
-class TrinkeyExperimentDump:
-    """Combined sensor and sampled nominal-motion stream for experiments."""
+class TrinkeyDataStream:
+    """Publish the one shared sensor, command, and observer stream."""
     def __init__(self, parent, update_interval):
         self.parent = parent
         self.api_dump = motion_report.APIDumpHelper(
@@ -232,7 +199,7 @@ class TrinkeyExperimentDump:
             self.parent.remove_stream_client()
 
     def _api_update(self, eventtime):
-        return self.parent.api_update_experiment(eventtime)
+        return self.parent._update_data_stream(eventtime)
 
     def _handle_dump(self, web_request):
         self.api_dump.add_client(web_request)
@@ -256,9 +223,9 @@ class TrinkeyExperimentDump:
             'reference': 'nominal_trapq_and_final_step_command_at_sample_time',
         })
 
-    def start_internal_client(self):
-        """Give future hybrid control the same batches sent to Motan."""
-        return self.api_dump.add_internal_client()
+    def start_observer_client(self, data_cb):
+        """Push the shared observer batches to one live internal consumer."""
+        return self.api_dump.add_internal_client(data_cb)
 
 
 class TrinkeyAccel:
@@ -343,11 +310,7 @@ class TrinkeyAccel:
         self.read_errors = 0
         self.firmware_status = {}
 
-        self.sensor_dumps = {
-            sensor: TrinkeySensorDump(self, sensor, api_update_interval)
-            for sensor in ('base', 'toolhead')
-        }
-        self.experiment_dump = TrinkeyExperimentDump(
+        self.data_stream = TrinkeyDataStream(
             self, api_update_interval)
         gcode = self.printer.lookup_object('gcode')
         gcode.register_command(
@@ -428,14 +391,25 @@ class TrinkeyAccel:
         self.kinematics = self.toolhead.get_kinematics()
         self.motion_steppers = self.kinematics.get_steppers()
 
-    def _get_commanded_position(self, print_time):
-        """Reconstruct final commanded XYZ from read-only step history."""
-        stepper_positions = {}
+    def _get_commanded_positions(self, timed_keys):
+        """Reconstruct a sorted batch with one history walk per stepper."""
+        if not timed_keys:
+            return {}
+        print_times = [print_time for print_time, unused in timed_keys]
+        stepper_batches = []
         for stepper in self.motion_steppers:
-            mcu_position = stepper.get_past_mcu_position(print_time)
-            stepper_positions[stepper.get_name()] = (
-                stepper.mcu_to_commanded_position(mcu_position))
-        return self.kinematics.calc_position(stepper_positions)
+            mcu_positions = stepper.get_past_mcu_positions(print_times)
+            stepper_batches.append((stepper, [
+                stepper.mcu_to_commanded_position(position)
+                for position in mcu_positions]))
+        commanded = {}
+        for index, (unused, key) in enumerate(timed_keys):
+            stepper_positions = {
+                stepper.get_name(): positions[index]
+                for stepper, positions in stepper_batches
+            }
+            commanded[key] = self.kinematics.calc_position(stepper_positions)
+        return commanded
 
     def _reset_axis_state(self, observer):
         """Reset dynamic state after a timing gap, retaining sensor bias."""
@@ -935,61 +909,19 @@ class TrinkeyAccel:
             self.clock_mapper.add(
                 device_time_us, print_time, host_after - host_before)
 
-    def api_update(self, sensor, eventtime):
-        if self.reader_error is not None:
-            raise self._command_error(
-                "Trinkey reader failed: %s" % (self.reader_error,))
-        self._update_clock_mapping()
-        with self.data_lock:
-            samples = list(self.sample_queues[sensor])
-            self.sample_queues[sensor].clear()
-        if not samples or not self.clock_mapper.ready:
-            return {}
-        scale = self.raw_scale
-        data = []
-        for sequence, device_time_us, x_raw, y_raw, z_raw, flags in samples:
-            print_time = self.clock_mapper.get_print_time(device_time_us)
-            data.append((
-                round(print_time, 9), device_time_us, sequence,
-                x_raw, y_raw, z_raw,
-                round(x_raw * scale, 6),
-                round(y_raw * scale, 6),
-                round(z_raw * scale, 6), flags))
-        clock_status = self.clock_mapper.get_status()
-        return {
-            'data': data,
-            'firmware': dict(self.firmware_status),
-            'clock': clock_status,
-            'host_queue_drops': self.host_queue_drops,
-            'frame_errors': self.frame_errors,
-            'packet_sequence_errors': self.packet_sequence_errors,
-            'sync_timeouts': self.sync_timeouts,
-            'read_errors': self.read_errors,
-        }
-
-    def api_update_experiment(self, eventtime):
-        """Return bounded sensor batches with a sampled nominal reference."""
-        if self.reader_error is not None:
-            raise self._command_error(
-                "Trinkey reader failed: %s" % (self.reader_error,))
-        self._update_clock_mapping()
-        if not self.clock_mapper.ready:
-            return {}
-
-        # A delayed event loop must not produce one unbounded JSON response.
-        # One second per sensor drains a backlog ten times faster than it is
-        # created at the default 100 ms API interval, while bounding each
-        # TrapQ extraction and socket message.
-        sample_batches = {}
+    def _drain_stream_samples(self):
+        """Drain a bounded raw batch without holding the lock during work."""
+        batches = {}
         with self.data_lock:
             for sensor in self.sensors:
                 queue = self.sample_queues[sensor]
                 count = min(len(queue), self.rate)
-                sample_batches[sensor] = [
+                batches[sensor] = [
                     queue.popleft() for unused in range(count)]
-        if not any(sample_batches.values()):
-            return {}
+        return batches
 
+    def _map_stream_samples(self, sample_batches):
+        """Map device timestamps once and build a global chronological index."""
         mapped = {}
         timed_keys = []
         for sensor, samples in sample_batches.items():
@@ -1004,7 +936,10 @@ class TrinkeyAccel:
                 timed_keys.append((print_time, (sensor, row_index)))
             mapped[sensor] = sensor_rows
         timed_keys.sort()
+        return mapped, timed_keys
 
+    def _sample_stream_references(self, timed_keys):
+        """Sample desired TrapQ motion with one extraction and ordered walk."""
         start_time = timed_keys[0][0]
         end_time = timed_keys[-1][0] + 1.e-9
         motion = self.printer.lookup_object('motion_report')
@@ -1013,10 +948,30 @@ class TrinkeyAccel:
             raise self._command_error(
                 "Toolhead TrapQ is unavailable for Trinkey reference data")
         moves, _cdata = toolhead_trapq.extract_trapq(start_time, end_time)
-        references = _sample_trapq_motion(moves, timed_keys)
+        return _sample_trapq_motion(moves, timed_keys)
 
+    def _sample_stream_commands(self, timed_keys, eventtime):
+        """Batch final step-command reconstruction for all sensor timestamps."""
         current_print_time = self.mcu.estimated_print_time(eventtime)
         valid_after = current_print_time - TRAPQ_HISTORY_SAFE_AGE
+        valid_timed_keys = [
+            item for item in timed_keys if item[0] >= valid_after]
+        if not valid_timed_keys or self.kinematics is None:
+            return {}, valid_after
+        try:
+            commanded = self._get_commanded_positions(valid_timed_keys)
+            return commanded, valid_after
+        except Exception:
+            self.motion_lookup_errors += len(valid_timed_keys)
+            if self.motion_lookup_errors == len(valid_timed_keys):
+                logging.exception(
+                    "Unable to reconstruct batched commanded positions "
+                    "(further errors are counted in status)")
+            return {}, valid_after
+
+    def _build_stream_rows(
+            self, mapped, references, commanded_positions, valid_after):
+        """Run the observer once and format the rows shared by all clients."""
         scale = self.raw_scale
         data = {}
         for sensor, rows in mapped.items():
@@ -1029,27 +984,14 @@ class TrinkeyAccel:
                  x_raw, y_raw, z_raw, flags) = row
                 reference_position, reference_acceleration, reference_found = (
                     references[(sensor, row_index)])
-                history_valid = print_time >= valid_after
-                motion_valid = history_valid and self.kinematics is not None
-                commanded_xyz = None
-                if motion_valid:
-                    try:
-                        commanded_xyz = self._get_commanded_position(print_time)
-                    except Exception:
-                        self.motion_lookup_errors += 1
-                        motion_valid = False
-                        if self.motion_lookup_errors == 1:
-                            logging.exception(
-                                "Unable to reconstruct commanded position at "
-                                "%.9f (further errors are counted in status)",
-                                print_time)
+                commanded_xyz = commanded_positions.get((sensor, row_index))
 
                 motor_position = 0.
                 motor_velocity = 0.
                 observed_position = 0.
                 observer_acceleration = 0.
                 observer_valid = 0
-                if motion_valid:
+                if commanded_xyz is not None:
                     motor_position = commanded_xyz[command_axis]
                     raw_values = (x_raw, y_raw, z_raw)
                     (motor_velocity, observed_position,
@@ -1071,9 +1013,11 @@ class TrinkeyAccel:
                     round(motor_position, 6), round(motor_velocity, 6),
                     round(observed_position, 6),
                     round(observer_acceleration, 6), observer_valid,
-                    int(history_valid and reference_found)))
+                    int(print_time >= valid_after and reference_found)))
             data[sensor] = output_rows
+        return data
 
+    def _add_stream_status(self, data):
         data.update({
             'firmware': dict(self.firmware_status),
             'clock': self.clock_mapper.get_status(),
@@ -1087,15 +1031,34 @@ class TrinkeyAccel:
         })
         return data
 
-    def start_internal_client(self, sensor):
-        if sensor not in self.sensor_dumps:
+    def _update_data_stream(self, eventtime):
+        """Build one bounded batch for every live stream consumer."""
+        if self.reader_error is not None:
             raise self._command_error(
-                "Unknown Trinkey accelerometer '%s'" % (sensor,))
-        return self.sensor_dumps[sensor].start_internal_client()
+                "Trinkey reader failed: %s" % (self.reader_error,))
+        self._update_clock_mapping()
+        if not self.clock_mapper.ready:
+            return {}
 
-    def start_observer_client(self):
+        # A delayed event loop must not produce one unbounded JSON response.
+        # One second per sensor drains a backlog ten times faster than it is
+        # created at the default 100 ms API interval, while bounding each
+        # TrapQ extraction and socket message.
+        sample_batches = self._drain_stream_samples()
+        if not any(sample_batches.values()):
+            return {}
+
+        mapped, timed_keys = self._map_stream_samples(sample_batches)
+        references = self._sample_stream_references(timed_keys)
+        commands, valid_after = self._sample_stream_commands(
+            timed_keys, eventtime)
+        data = self._build_stream_rows(
+            mapped, references, commands, valid_after)
+        return self._add_stream_status(data)
+
+    def start_observer_client(self, data_cb):
         """Subscribe to the shared experiment/observer batches."""
-        return self.experiment_dump.start_internal_client()
+        return self.data_stream.start_observer_client(data_cb)
 
     def is_streaming(self):
         return self.streaming or self.stream_clients > 0

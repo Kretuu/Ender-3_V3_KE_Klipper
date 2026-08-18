@@ -74,6 +74,9 @@ struct fbf_batch {
 
 struct fbf_controller {
     int mode, initialized;
+    // Incremented whenever prepared batches are invalidated.  Kinematics
+    // wrappers use it to reject copied lookup caches after a coordinate reset.
+    unsigned int generation;
     // Fixed print-time origin for k=0 on the hybrid 1 kHz sample grid.  It is
     // set once per continuous controller trajectory and does not advance with
     // individual G-code moves or FBF batches.
@@ -84,6 +87,7 @@ struct fbf_controller {
     int hybrid_warmup_samples;
     double position_min[FBF_AXIS_COUNT], position_max[FBF_AXIS_COUNT];
     struct fbf_axis axis[FBF_AXIS_COUNT];
+    struct fbf_batch *nominal_cache[FBF_AXIS_COUNT];
     struct list_head batches;
 };
 
