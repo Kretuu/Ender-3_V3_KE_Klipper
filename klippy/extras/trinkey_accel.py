@@ -46,7 +46,7 @@ DEFAULT_INITIAL_SYNC_SAMPLES = 12
 DEFAULT_RAW_SCALE = 10.0  # BNO055 default m/s^2 units: 100 LSB/(m/s^2)
 SYNC_RTT_TOLERANCE = 0.001  # Experiment-specific USB RTT margin, seconds.
 TRAPQ_HISTORY_SAFE_AGE = 25.0  # trapq.c retains 30 seconds of history.
-OBSERVER_TIME_TOLERANCE = 0.25
+OBSERVER_MAX_VELOCITY = 1000.0  # Reject command-coordinate discontinuities.
 
 
 def _sample_trapq_motion(moves, timed_keys):
@@ -355,10 +355,13 @@ class TrinkeyAccel:
             gv = config.getfloatlist(prefix + 'gv', count=state_count)
             ga = config.getfloatlist(prefix + 'ga', count=state_count)
             ho = config.getfloatlist(prefix + 'ho', count=state_count)
+            hu = config.getfloat(prefix + 'hu')
+            hv = config.getfloat(prefix + 'hv')
+            ha = config.getfloat(prefix + 'ha')
             x0 = config.getfloatlist(
                 prefix + 'x0_per_mm', count=state_count)
             observer = self.ffi_lib.state_space_observer_alloc(
-                state_count, fo, gu, gv, ga, ho, x0)
+                state_count, fo, gu, gv, ga, ho, hu, hv, ha, x0)
             if observer == self.ffi_main.NULL:
                 raise config.error(
                     "Invalid %s-axis state-space observer matrices"
@@ -367,7 +370,6 @@ class TrinkeyAccel:
                 'c': self.ffi_main.gc(
                     observer, self.ffi_lib.state_space_observer_free),
                 'sign': signs[axis],
-                'sample_time': 1. / observer_rate,
                 'bias_samples': bias_samples,
             }
         self._reset_observers()
@@ -382,6 +384,7 @@ class TrinkeyAccel:
                 'bias': 0.,
                 'bias_ready': observer['bias_samples'] == 0,
                 'last_time': None,
+                'last_sequence': None,
                 'last_position': 0.,
             })
 
@@ -412,15 +415,18 @@ class TrinkeyAccel:
         return commanded
 
     def _reset_axis_state(self, observer):
-        """Reset dynamic state after a timing gap, retaining sensor bias."""
-        if observer['last_time'] is None:
+        """Reset dynamic state after a sample gap, retaining sensor bias."""
+        if observer['last_sequence'] is None:
             return
         self.ffi_lib.state_space_observer_reset(observer['c'])
         observer['last_time'] = None
+        observer['last_sequence'] = None
         observer['last_position'] = 0.
         self.observer_resets += 1
 
-    def _observe_axis(self, axis, print_time, position, measured_acceleration):
+    def _observe_axis(
+            self, axis, sequence, print_time, position,
+            measured_acceleration):
         """Run one fixed-rate observer sample and return logged scalars."""
         observer = self.observer_axes.get(axis)
         if observer is None:
@@ -438,23 +444,28 @@ class TrinkeyAccel:
 
         corrected_acceleration = acceleration - observer['bias']
         last_time = observer['last_time']
+        last_sequence = observer['last_sequence']
         velocity = 0.
         valid = 0
-        if last_time is not None:
+        if last_sequence is not None:
             sample_time = print_time - last_time
-            expected_time = observer['sample_time']
-            timing_error = abs(sample_time - expected_time) / expected_time
-            if sample_time <= 0. or timing_error > OBSERVER_TIME_TOLERANCE:
+            sequence_step = (sequence - last_sequence) & 0xffffffff
+            if sequence_step != 1 or sample_time <= 0.:
                 self._reset_axis_state(observer)
                 valid = 0
             else:
                 velocity = (
                     position - observer['last_position']) / sample_time
-                valid = 1
+                if abs(velocity) > OBSERVER_MAX_VELOCITY:
+                    self._reset_axis_state(observer)
+                    velocity = 0.
+                else:
+                    valid = 1
 
         estimated_position = self.ffi_lib.state_space_observer_sample(
             observer['c'], position, velocity, corrected_acceleration)
         observer['last_time'] = print_time
+        observer['last_sequence'] = sequence
         observer['last_position'] = position
         return velocity, estimated_position, corrected_acceleration, valid
 
@@ -997,7 +1008,7 @@ class TrinkeyAccel:
                     (motor_velocity, observed_position,
                      observer_acceleration, observer_valid) = (
                         self._observe_axis(
-                            axis, print_time, motor_position,
+                            axis, sequence, print_time, motor_position,
                             raw_values[raw_axis] * scale))
                 elif axis in self.observer_axes:
                     self._reset_axis_state(self.observer_axes[axis])

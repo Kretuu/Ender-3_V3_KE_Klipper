@@ -19,11 +19,9 @@ struct state_space_observer {
     double gv[OBSERVER_MAX_STATES];
     double ga[OBSERVER_MAX_STATES];
     double ho[OBSERVER_MAX_STATES];
+    double hu, hv, ha;
     double x0_per_unit[OBSERVER_MAX_STATES];
     double state[OBSERVER_MAX_STATES];
-    double previous_position;
-    double previous_velocity;
-    double previous_acceleration;
 };
 
 static int
@@ -39,6 +37,7 @@ all_finite(double values[], int count)
 struct state_space_observer * __visible
 state_space_observer_alloc(int state_count, double fo[], double gu[]
                            , double gv[], double ga[], double ho[]
+                           , double hu, double hv, double ha
                            , double x0_per_unit[])
 {
     if (state_count < 1 || state_count > OBSERVER_MAX_STATES
@@ -47,6 +46,7 @@ state_space_observer_alloc(int state_count, double fo[], double gu[]
         || !all_finite(gv, state_count)
         || !all_finite(ga, state_count)
         || !all_finite(ho, state_count)
+        || !isfinite(hu) || !isfinite(hv) || !isfinite(ha)
         || !all_finite(x0_per_unit, state_count))
         return NULL;
 
@@ -61,6 +61,9 @@ state_space_observer_alloc(int state_count, double fo[], double gu[]
     memcpy(observer->gv, gv, state_count * sizeof(double));
     memcpy(observer->ga, ga, state_count * sizeof(double));
     memcpy(observer->ho, ho, state_count * sizeof(double));
+    observer->hu = hu;
+    observer->hv = hv;
+    observer->ha = ha;
     memcpy(observer->x0_per_unit, x0_per_unit,
            state_count * sizeof(double));
     return observer;
@@ -80,8 +83,8 @@ state_space_observer_reset(struct state_space_observer *observer)
 }
 
 /**
- * Return the position estimate at the current sample time and advance the
- * state using the inputs held since the preceding sample.
+ * Apply the current Kalman measurement update, return its posterior position,
+ * and retain the next prior state for the following sample.
  */
 double __visible
 state_space_observer_sample(struct state_space_observer *observer
@@ -95,30 +98,28 @@ state_space_observer_sample(struct state_space_observer *observer
             observer->state[index]
                 = observer->x0_per_unit[index] * input_position;
         observer->initialized = 1;
-    } else {
-        double next_state[OBSERVER_MAX_STATES];
-        int row, column;
-        for (row = 0; row < state_count; row++) {
-            double value = 0.;
-            for (column = 0; column < state_count; column++)
-                value += observer->fo[row * state_count + column]
-                       * observer->state[column];
-            next_state[row] = value
-                + observer->gu[row] * observer->previous_position
-                + observer->gv[row] * observer->previous_velocity
-                + observer->ga[row] * observer->previous_acceleration;
-        }
-        memcpy(observer->state, next_state,
-               state_count * sizeof(double));
     }
 
-    observer->previous_position = input_position;
-    observer->previous_velocity = input_velocity;
-    observer->previous_acceleration = measured_acceleration;
-
-    double output = 0.;
+    double output = observer->hu * input_position
+                  + observer->hv * input_velocity
+                  + observer->ha * measured_acceleration;
     int index;
     for (index = 0; index < state_count; index++)
         output += observer->ho[index] * observer->state[index];
+
+    double next_state[OBSERVER_MAX_STATES];
+    int row, column;
+    for (row = 0; row < state_count; row++) {
+        double value = 0.;
+        for (column = 0; column < state_count; column++)
+            value += observer->fo[row * state_count + column]
+                   * observer->state[column];
+        next_state[row] = value
+            + observer->gu[row] * input_position
+            + observer->gv[row] * input_velocity
+            + observer->ga[row] * measured_acceleration;
+    }
+    memcpy(observer->state, next_state,
+           state_count * sizeof(double));
     return output;
 }
