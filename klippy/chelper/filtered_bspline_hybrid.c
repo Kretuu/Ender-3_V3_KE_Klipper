@@ -5,28 +5,10 @@
 // This file may be distributed under the terms of the GNU GPLv3 license.
 
 #include <math.h> // fabs, isfinite, llround
+#include <stdlib.h> // free, malloc
 #include <string.h> // memcpy, memmove, memset
+#include "compiler.h" // __visible
 #include "filtered_bspline_internal.h"
-
-/**
- * Constant and gamma_C-dependent parts of one future prediction:
- *
- *     yhat_pb(k) = offset + coefficient^T * gamma_C, or
- *     ehat_pb(k) = offset + coefficient^T * gamma_C.
- *
- * The offset stores the part already determined by past samples and committed
- * B-spline coefficients.  The coefficient vector stores how the prediction
- * depends on each current B-spline coefficient in the still-unknown gamma_C.
- *
- * Keeping future values in this form lets the residual predictor be evaluated
- * recursively without first knowing gamma_C.  Adding the nominal and residual
- * forms for every preview sample produces the corresponding row of
- * y_h = A_h * gamma_C + b_h used by the final least-squares problem.
- */
-struct affine_value {
-    double offset;
-    double coefficient[FBF_CURRENT_COEFFICIENTS];
-};
 
 /** Shift an oldest-to-newest scalar history and append the current sample. */
 static void
@@ -37,56 +19,78 @@ shift_scalar_history(double history[], int count, double value)
     history[count - 1] = value;
 }
 
-/** Shift an oldest-to-newest affine history and append one prediction. */
+/** Shift a history of coefficient vectors and append the current vector. */
 static void
-shift_affine_history(struct affine_value history[], int count,
-                     const struct affine_value *value)
+shift_coefficient_history(
+    double history[][FBF_CURRENT_COEFFICIENTS], int count,
+    const double value[FBF_CURRENT_COEFFICIENTS])
 {
     if (count > 1)
         memmove(history, history + 1,
-                (count - 1) * sizeof(struct affine_value));
-    history[count - 1] = *value;
+                (count - 1) * FBF_CURRENT_COEFFICIENTS * sizeof(double));
+    memcpy(history[count - 1], value,
+           FBF_CURRENT_COEFFICIENTS * sizeof(double));
 }
 
-/** Reset ridge RLS to w=0 and P=lambda^-1 I. */
+/** Discard values derived from a superseded immutable learner snapshot. */
 void
-fbf_hybrid_reset(struct fbf_axis *axis, double initial_position,
-                 double regularization, int warmup_samples)
+fbf_hybrid_invalidate_snapshot_caches(struct fbf_axis *axis)
 {
-    struct hybrid_learner *learner = &axis->hybrid;
-    memset(learner, 0, sizeof(*learner));
-    learner->regularization = regularization;
-    learner->warmup_samples = warmup_samples;
-    learner->latest_sample_index = -1;
-    // Ridge-RLS initial conditions: w(0)=0 and P(0)=lambda^-1*I.
+    memset(&axis->prediction_cache, 0, sizeof(axis->prediction_cache));
+    axis->prediction_cache.latest_sample_index = -1;
+    axis->factorization_cache.valid = 0;
+}
+
+/** Remove the last complete learner snapshot from the motion controller. */
+void
+fbf_hybrid_reset_prediction(struct fbf_axis *axis)
+{
+    memset(&axis->applied_snapshot, 0, sizeof(axis->applied_snapshot));
+    axis->applied_snapshot.latest_sample_index = -1;
+    fbf_hybrid_invalidate_snapshot_caches(axis);
+    axis->solve_fallbacks = axis->hybrid_solves = 0;
+    axis->prediction_gap_samples = 0;
+    axis->maximum_prediction_gap_samples = 0;
+    axis->history_replay_samples = 0;
+    axis->maximum_history_replay_samples = 0;
+}
+
+
+/****************************************************************
+ * Worker-owned residual learner
+ ****************************************************************/
+
+/** Reset one worker-owned RLS state while preserving its plant model. */
+static void
+reset_training_axis(struct fbf_hybrid_learner *learner, int axis_index)
+{
+    struct hybrid_training_axis *axis = &learner->axis[axis_index];
+    memset(axis->command_history, 0, sizeof(axis->command_history));
+    memset(axis->covariance, 0, sizeof(axis->covariance));
+    memset(&axis->snapshot, 0, sizeof(axis->snapshot));
+    axis->snapshot.latest_sample_index = -1;
+    axis->have_observation = 0;
     int row;
     for (row = 0; row < HYBRID_FEATURES; row++)
-        learner->covariance[row][row] = 1. / regularization;
-    for (row = 0; row < HYBRID_NOMINAL_TERMS - 1; row++)
-        learner->nominal_history[row] = initial_position;
+        axis->covariance[row][row] = 1. / learner->regularization;
 }
 
-/** Apply one recursive least-squares update using a measured residual. */
-int
-fbf_hybrid_train_residual_sample(struct fbf_axis *axis, double nominal,
-                                 double residual, long long sample_index)
+/** Apply one recursive least-squares update without advancing 1 kHz state. */
+static int
+update_residual_weights(struct hybrid_training_axis *axis, double nominal,
+                        double residual)
 {
-    struct hybrid_learner *learner = &axis->hybrid;
-    if (sample_index != learner->latest_sample_index + 1) {
-        learner->measurement_errors++;
-        return -1;
-    }
-
+    struct hybrid_snapshot *snapshot = &axis->snapshot;
     // phi(k)=[1, yhat_pb(k-q+1...k), e_pb(k-p...k-1)]^T.
     double feature[HYBRID_FEATURES];
     feature[0] = 1.;
     int index;
     for (index = 0; index < HYBRID_NOMINAL_TERMS - 1; index++)
-        feature[1 + index] = learner->nominal_history[index];
+        feature[1 + index] = snapshot->nominal_history[index];
     feature[HYBRID_NOMINAL_TERMS] = nominal;
     for (index = 0; index < HYBRID_RESIDUAL_TERMS; index++)
         feature[1 + HYBRID_NOMINAL_TERMS + index]
-            = learner->residual_history[index];
+            = snapshot->residual_history[index];
 
     // Reused RLS product: p_feature=P(k-1)*phi(k).
     double p_feature[HYBRID_FEATURES];
@@ -94,7 +98,7 @@ fbf_hybrid_train_residual_sample(struct fbf_axis *axis, double nominal,
     for (row = 0; row < HYBRID_FEATURES; row++) {
         double value = 0.;
         for (column = 0; column < HYBRID_FEATURES; column++)
-            value += learner->covariance[row][column] * feature[column];
+            value += axis->covariance[row][column] * feature[column];
         p_feature[row] = value;
     }
     // RLS denominator: 1+phi(k)^T*P(k-1)*phi(k).
@@ -102,21 +106,21 @@ fbf_hybrid_train_residual_sample(struct fbf_axis *axis, double nominal,
     for (index = 0; index < HYBRID_FEATURES; index++)
         denominator += feature[index] * p_feature[index];
     if (!isfinite(denominator) || denominator <= 1.0e-12) {
-        learner->measurement_errors++;
+        snapshot->measurement_errors++;
         return -1;
     }
 
     // Prediction error: e_pb(k)-w(k-1)^T*phi(k).
     double predicted = 0.;
     for (index = 0; index < HYBRID_FEATURES; index++)
-        predicted += learner->weights[index] * feature[index];
+        predicted += snapshot->weights[index] * feature[index];
     double prediction_error = residual - predicted;
     double inverse_denominator = 1. / denominator;
     double gain[HYBRID_FEATURES];
     // w(k)=w(k-1)+P*phi/(1+phi^T*P*phi)*prediction_error.
     for (index = 0; index < HYBRID_FEATURES; index++) {
         gain[index] = p_feature[index] * inverse_denominator;
-        learner->weights[index]
+        snapshot->weights[index]
             += gain[index] * prediction_error;
     }
 
@@ -125,22 +129,240 @@ fbf_hybrid_train_residual_sample(struct fbf_axis *axis, double nominal,
     // one triangle and mirror it instead of calculating both halves.
     for (row = 0; row < HYBRID_FEATURES; row++) {
         for (column = row; column < HYBRID_FEATURES; column++) {
-            double value = learner->covariance[row][column]
+            double value = axis->covariance[row][column]
                 - gain[row] * p_feature[column];
-            learner->covariance[row][column] = value;
-            learner->covariance[column][row] = value;
+            axis->covariance[row][column] = value;
+            axis->covariance[column][row] = value;
         }
     }
 
-    // Advance phi(k)'s histories so this sample is "past" at k+1.
-    shift_scalar_history(learner->nominal_history,
-                         HYBRID_NOMINAL_TERMS - 1, nominal);
-    shift_scalar_history(learner->residual_history,
-                         HYBRID_RESIDUAL_TERMS, residual);
-    learner->latest_sample_index = sample_index;
-    learner->training_samples++;
+    snapshot->training_samples++;
     return 0;
 }
+
+/** Make one resampled value part of the past for the next 1 kHz sample. */
+static int
+advance_residual_history(struct hybrid_training_axis *axis, double nominal,
+                         double residual, long long sample_index)
+{
+    struct hybrid_snapshot *snapshot = &axis->snapshot;
+    if (sample_index != snapshot->latest_sample_index + 1) {
+        snapshot->measurement_errors++;
+        return -1;
+    }
+    shift_scalar_history(snapshot->nominal_history,
+                         HYBRID_NOMINAL_TERMS - 1, nominal);
+    shift_scalar_history(snapshot->residual_history,
+                         HYBRID_RESIDUAL_TERMS, residual);
+    snapshot->latest_sample_index = sample_index;
+    snapshot->history_samples++;
+    return 0;
+}
+
+struct fbf_hybrid_learner * __visible
+filtered_bspline_learner_alloc(void)
+{
+    struct fbf_hybrid_learner *learner = malloc(sizeof(*learner));
+    if (!learner)
+        return NULL;
+    memset(learner, 0, sizeof(*learner));
+    learner->regularization = 0.01;
+    reset_training_axis(learner, 0);
+    reset_training_axis(learner, 1);
+    return learner;
+}
+
+void __visible
+filtered_bspline_learner_free(struct fbf_hybrid_learner *learner)
+{
+    free(learner);
+}
+
+int __visible
+filtered_bspline_learner_configure_axis(
+    struct fbf_hybrid_learner *learner, char axis, int numerator_count,
+    double numerator[], int denominator_count, double denominator[])
+{
+    if (axis != 'x' && axis != 'y')
+        return -1;
+    struct hybrid_training_axis *axis_data = &learner->axis[axis - 'x'];
+    if (fbf_build_impulse_response(
+            axis_data->impulse, numerator_count, numerator,
+            denominator_count, denominator))
+        return -1;
+    axis_data->configured = 1;
+    return 0;
+}
+
+int __visible
+filtered_bspline_learner_configure(struct fbf_hybrid_learner *learner,
+                                   double regularization,
+                                   int warmup_samples)
+{
+    if (!isfinite(regularization) || regularization <= 0.
+        || warmup_samples < HYBRID_RESIDUAL_TERMS)
+        return -1;
+    learner->regularization = regularization;
+    reset_training_axis(learner, 0);
+    reset_training_axis(learner, 1);
+    return 0;
+}
+
+static void
+reset_learner_trajectory(struct fbf_hybrid_learner *learner,
+                         unsigned int generation,
+                         double trajectory_start_time)
+{
+    learner->generation = generation;
+    learner->trajectory_start_time = trajectory_start_time;
+    learner->initialized = 1;
+    reset_training_axis(learner, 0);
+    reset_training_axis(learner, 1);
+}
+
+/** Start a continuous observation segment without inventing missing data. */
+static int
+restart_observation_segment(struct fbf_hybrid_learner *learner,
+                            int axis_index, double print_time,
+                            double motor_position, double observed_position)
+{
+    struct hybrid_training_axis *axis = &learner->axis[axis_index];
+    struct hybrid_snapshot *snapshot = &axis->snapshot;
+    long long sample_index = floor(
+        (print_time - learner->trajectory_start_time) / FBF_SAMPLE_TIME);
+    if (sample_index < 0)
+        return -1;
+
+    int index;
+    for (index = 0; index < FBF_IMPULSE_SAMPLES; index++)
+        axis->command_history[index] = motor_position;
+    for (index = 0; index < HYBRID_NOMINAL_TERMS - 1; index++)
+        snapshot->nominal_history[index] = motor_position;
+    memset(snapshot->residual_history, 0,
+           sizeof(snapshot->residual_history));
+    snapshot->residual_history[HYBRID_RESIDUAL_TERMS - 1]
+        = observed_position - motor_position;
+    snapshot->latest_sample_index = sample_index;
+    axis->last_observation_time = print_time;
+    axis->last_motor_position = motor_position;
+    axis->last_observed_position = observed_position;
+    axis->have_observation = 1;
+    return 0;
+}
+
+/** Filter one committed command through the same finite plant model as FBF. */
+static double
+calculate_nominal_sample(struct hybrid_training_axis *axis,
+                         double motor_position)
+{
+    shift_scalar_history(
+        axis->command_history, FBF_IMPULSE_SAMPLES, motor_position);
+    double nominal = 0.;
+    int impulse_index;
+    for (impulse_index = 0; impulse_index < FBF_IMPULSE_SAMPLES;
+         impulse_index++)
+        nominal += axis->impulse[impulse_index]
+            * axis->command_history[FBF_IMPULSE_SAMPLES - 1 - impulse_index];
+    return nominal;
+}
+
+/** Advance the model and residual learner on their shared 1 kHz grid. */
+int __visible
+filtered_bspline_learner_add_observation(
+    struct fbf_hybrid_learner *learner, char axis, unsigned int generation,
+    double trajectory_start_time, double print_time, double motor_position,
+    double observed_position)
+{
+    if ((axis != 'x' && axis != 'y') || !generation
+        || !isfinite(trajectory_start_time) || !isfinite(print_time)
+        || !isfinite(motor_position) || !isfinite(observed_position))
+        return -1;
+    if (!learner->initialized || learner->generation != generation
+        || fabs(learner->trajectory_start_time - trajectory_start_time)
+           > FBF_TIME_EPSILON)
+        reset_learner_trajectory(
+            learner, generation, trajectory_start_time);
+    if (print_time < trajectory_start_time - FBF_TIME_EPSILON)
+        return 0;
+
+    int axis_index = axis - 'x';
+    struct hybrid_training_axis *axis_data = &learner->axis[axis_index];
+    if (!axis_data->configured)
+        return -1;
+    if (!axis_data->have_observation)
+        return restart_observation_segment(
+            learner, axis_index, print_time, motor_position,
+            observed_position);
+
+    double interval = print_time - axis_data->last_observation_time;
+    if (interval <= 0. || interval > HYBRID_MAX_OBSERVATION_GAP) {
+        axis_data->snapshot.measurement_errors++;
+        return restart_observation_segment(
+            learner, axis_index, print_time, motor_position,
+            observed_position);
+    }
+
+    long long last_index = floor(
+        (print_time - trajectory_start_time) / FBF_SAMPLE_TIME
+        + FBF_TIME_EPSILON);
+    long long sample_index;
+    for (sample_index = axis_data->snapshot.latest_sample_index + 1;
+         sample_index <= last_index; sample_index++) {
+        double sample_time = trajectory_start_time
+            + sample_index * FBF_SAMPLE_TIME;
+        if (sample_time <= axis_data->last_observation_time
+            + FBF_TIME_EPSILON)
+            continue;
+        double fraction = (sample_time - axis_data->last_observation_time)
+            / interval;
+        if (fraction > 1. + FBF_TIME_EPSILON)
+            break;
+        double motor = axis_data->last_motor_position
+            + fraction * (motor_position - axis_data->last_motor_position);
+        double observed = axis_data->last_observed_position
+            + fraction * (observed_position
+                          - axis_data->last_observed_position);
+        double nominal = calculate_nominal_sample(axis_data, motor);
+        double residual = observed - nominal;
+        if (update_residual_weights(axis_data, nominal, residual))
+            return -2;
+        if (advance_residual_history(
+                axis_data, nominal, residual, sample_index))
+            return -2;
+    }
+    axis_data->last_observation_time = print_time;
+    axis_data->last_motor_position = motor_position;
+    axis_data->last_observed_position = observed_position;
+    return 0;
+}
+
+int __visible
+filtered_bspline_learner_get_snapshot(
+    struct fbf_hybrid_learner *learner, char axis,
+    int *history_samples, int *training_samples, int *measurement_errors,
+    long long *latest_sample_index, double weights[],
+    double nominal_history[], double residual_history[])
+{
+    if (axis != 'x' && axis != 'y')
+        return -1;
+    struct hybrid_snapshot *snapshot
+        = &learner->axis[axis - 'x'].snapshot;
+    *history_samples = snapshot->history_samples;
+    *training_samples = snapshot->training_samples;
+    *measurement_errors = snapshot->measurement_errors;
+    *latest_sample_index = snapshot->latest_sample_index;
+    memcpy(weights, snapshot->weights, sizeof(snapshot->weights));
+    memcpy(nominal_history, snapshot->nominal_history,
+           sizeof(snapshot->nominal_history));
+    memcpy(residual_history, snapshot->residual_history,
+           sizeof(snapshot->residual_history));
+    return 0;
+}
+
+
+/****************************************************************
+ * Reactor-owned hybrid preview prediction
+ ****************************************************************/
 
 /** Retrieve the nominal prediction stored for one committed 1 kHz sample. */
 int
@@ -184,21 +406,21 @@ fbf_hybrid_lookup_nominal_prediction(struct fbf_controller *controller,
 
 /** Evaluate ehat_pb(k)=w^T*phi(k) when every regressor value is numeric. */
 static double
-predict_scalar_residual(struct hybrid_learner *learner,
+predict_scalar_residual(const double weights[HYBRID_FEATURES],
                         double nominal_history[], double nominal,
                         double residual_history[])
 {
     // Bias weight.
-    double value = learner->weights[0];
+    double value = weights[0];
     int index;
     // q-1 previous nominal predictions.
     for (index = 0; index < HYBRID_NOMINAL_TERMS - 1; index++)
-        value += learner->weights[1 + index] * nominal_history[index];
+        value += weights[1 + index] * nominal_history[index];
     // Current nominal prediction yhat_pb(k), completing the q terms.
-    value += learner->weights[HYBRID_NOMINAL_TERMS] * nominal;
+    value += weights[HYBRID_NOMINAL_TERMS] * nominal;
     // p previous measured or recursively predicted residuals.
     for (index = 0; index < HYBRID_RESIDUAL_TERMS; index++)
-        value += learner->weights[1 + HYBRID_NOMINAL_TERMS + index]
+        value += weights[1 + HYBRID_NOMINAL_TERMS + index]
             * residual_history[index];
     return value;
 }
@@ -209,25 +431,32 @@ prepare_hybrid_history(struct fbf_controller *controller, int axis_index,
                        double start_time, double nominal_history[],
                        double residual_history[])
 {
-    struct hybrid_learner *learner = &controller->axis[axis_index].hybrid;
-    // Start from the histories ending at the latest measured residual.
-    memcpy(nominal_history, learner->nominal_history,
-           sizeof(learner->nominal_history));
-    memcpy(residual_history, learner->residual_history,
-           sizeof(learner->residual_history));
-
+    struct fbf_axis *axis = &controller->axis[axis_index];
+    struct hybrid_snapshot *snapshot = &axis->applied_snapshot;
     // k_0 is the first sample of the new FBF preview window.
     long long start_index = llround(
         (start_time - controller->trajectory_start_time) / FBF_SAMPLE_TIME);
-    if (learner->latest_sample_index >= start_index)
+    axis->history_replay_samples = 0;
+    if (snapshot->latest_sample_index >= start_index)
         return -1;
-    long long gap_samples = start_index - learner->latest_sample_index - 1;
-    learner->prediction_gap_samples = gap_samples;
-    if (gap_samples > learner->maximum_prediction_gap_samples)
-        learner->maximum_prediction_gap_samples = gap_samples;
+    long long gap_samples = start_index - snapshot->latest_sample_index - 1;
+    axis->prediction_gap_samples = gap_samples;
+    if (gap_samples > axis->maximum_prediction_gap_samples)
+        axis->maximum_prediction_gap_samples = gap_samples;
+
+    struct hybrid_prediction_cache *cache = &axis->prediction_cache;
+    if (!cache->valid || cache->latest_sample_index >= start_index) {
+        // A newly adopted snapshot starts with measured residual history.
+        memcpy(cache->nominal_history, snapshot->nominal_history,
+               sizeof(cache->nominal_history));
+        memcpy(cache->residual_history, snapshot->residual_history,
+               sizeof(cache->residual_history));
+        cache->latest_sample_index = snapshot->latest_sample_index;
+        cache->valid = 1;
+    }
     // Recursively predict ehat_pb for every unmeasured sample before k_0.
     long long sample_index;
-    for (sample_index = learner->latest_sample_index + 1;
+    for (sample_index = cache->latest_sample_index + 1;
          sample_index < start_index; sample_index++) {
         double nominal;
         double print_time = controller->trajectory_start_time
@@ -238,149 +467,157 @@ prepare_hybrid_history(struct fbf_controller *controller, int axis_index,
             return -1;
         // Calculate one ehat_pb(k), then make it a past value for k+1.
         double residual = predict_scalar_residual(
-            learner, nominal_history, nominal, residual_history);
-        shift_scalar_history(nominal_history,
+            snapshot->weights, cache->nominal_history, nominal,
+            cache->residual_history);
+        shift_scalar_history(cache->nominal_history,
                              HYBRID_NOMINAL_TERMS - 1, nominal);
-        shift_scalar_history(residual_history,
+        shift_scalar_history(cache->residual_history,
                              HYBRID_RESIDUAL_TERMS, residual);
+        cache->latest_sample_index = sample_index;
+        axis->history_replay_samples++;
+        if (axis->history_replay_samples
+            > axis->maximum_history_replay_samples)
+            axis->maximum_history_replay_samples
+                = axis->history_replay_samples;
     }
+    memcpy(nominal_history, cache->nominal_history,
+           sizeof(cache->nominal_history));
+    memcpy(residual_history, cache->residual_history,
+           sizeof(cache->residual_history));
     return 0;
 }
 
+/** Accumulate destination += scale * source for two coefficient vectors. */
+static void
+add_scaled_coefficients(double destination[FBF_CURRENT_COEFFICIENTS],
+                        const double source[FBF_CURRENT_COEFFICIENTS],
+                        double scale)
+{
+    int column;
+    for (column = 0; column < FBF_CURRENT_COEFFICIENTS; column++)
+        destination[column] += scale * source[column];
+}
+
 /**
- * Accumulate destination += scale * source for two affine values.
+ * Build A_h(w), the linear map from current coefficients to hybrid output.
  *
- * A value represents either yhat_pb(k) or ehat_pb(k) as an offset plus a
- * coefficient vector multiplying gamma_C.  Scaling and adding it therefore
- * requires applying the same scale to both parts.  This is how one weighted
- * term of the learned regressor is added without yet knowing gamma_C.
+ * Past nominal and residual values have zero derivatives with respect to the
+ * new gamma_C.  Future derivatives are propagated through the fixed learned
+ * residual model.  Consequently A_h depends only on w and the fixed current
+ * B-spline basis; numeric histories and start_index do not enter this method.
  */
 static void
-add_scaled_affine(struct affine_value *destination,
-                  const struct affine_value *source, double scale)
+build_hybrid_preview_matrix(
+    const double weights[HYBRID_FEATURES],
+    const double current_basis
+        [FBF_PREVIEW_SAMPLES][FBF_CURRENT_COEFFICIENTS],
+    double matrix[FBF_PREVIEW_SAMPLES][FBF_CURRENT_COEFFICIENTS])
 {
-    destination->offset += scale * source->offset;
-    int column;
-    for (column = 0; column < FBF_CURRENT_COEFFICIENTS; column++)
-        destination->coefficient[column]
-            += scale * source->coefficient[column];
-}
-
-/** Convert the measured/predicted scalar past into affine constants. */
-static void
-initialize_affine_histories(
-    double nominal_scalar[], double residual_scalar[],
-    struct affine_value nominal_history[],
-    struct affine_value residual_history[])
-{
-    // Past values are known: value=offset+0^T*gamma_C.
-    memset(nominal_history, 0,
-           (HYBRID_NOMINAL_TERMS - 1) * sizeof(struct affine_value));
-    memset(residual_history, 0,
-           HYBRID_RESIDUAL_TERMS * sizeof(struct affine_value));
-    int index;
-    for (index = 0; index < HYBRID_NOMINAL_TERMS - 1; index++)
-        nominal_history[index].offset = nominal_scalar[index];
-    for (index = 0; index < HYBRID_RESIDUAL_TERMS; index++)
-        residual_history[index].offset = residual_scalar[index];
-}
-
-/** Build y_pb(k)=a_pb(k)'*gamma_C+b_pb(k) for one preview row. */
-static void
-build_nominal_affine(struct fbf_axis *axis, int row,
-                     struct affine_value *nominal)
-{
-    memset(nominal, 0, sizeof(*nominal));
-    // b_pb(k)=[tilde_Phi_PC](k,:)*gamma_P from committed coefficients.
-    int history_index;
-    for (history_index = 0;
-         history_index < FBF_HISTORY_COEFFICIENTS; history_index++)
-        nominal->offset += axis->history[history_index]
-            * axis->filtered_history_basis[row][history_index];
-    // a_pb(k)^T=[tilde_Phi_C](k,:), multiplying the unknown gamma_C.
-    int column;
-    for (column = 0; column < FBF_CURRENT_COEFFICIENTS; column++)
-        nominal->coefficient[column]
-            = axis->filtered_current_basis[row][column];
-}
-
-/** Build e_hat(k)=a_e(k)'*gamma_C+b_e(k) from the learned regressor. */
-static void
-build_residual_affine(
-    struct hybrid_learner *learner,
-    struct affine_value nominal_history[],
-    struct affine_value *nominal,
-    struct affine_value residual_history[],
-    struct affine_value *residual)
-{
-    memset(residual, 0, sizeof(*residual));
-    // Regression bias w_0.
-    residual->offset = learner->weights[0];
-    int index;
-    // Weighted yhat_pb(k-q+1...k-1) terms.
-    for (index = 0; index < HYBRID_NOMINAL_TERMS - 1; index++)
-        add_scaled_affine(residual, &nominal_history[index],
-                          learner->weights[1 + index]);
-    // Weighted current yhat_pb(k), completing the q nominal terms.
-    add_scaled_affine(
-        residual, nominal, learner->weights[HYBRID_NOMINAL_TERMS]);
-    // Weighted e_pb(k-p...k-1), including earlier preview predictions.
-    for (index = 0; index < HYBRID_RESIDUAL_TERMS; index++)
-        add_scaled_affine(
-            residual, &residual_history[index],
-            learner->weights[1 + HYBRID_NOMINAL_TERMS + index]);
-}
-
-/** Assemble A_h and y_d-b_h by walking the recursive preview in time. */
-static void
-build_hybrid_preview_system(
-    struct fbf_axis *axis, double desired[], double nominal_scalar[],
-    double residual_scalar[],
-    double matrix[FBF_PREVIEW_SAMPLES][FBF_CURRENT_COEFFICIENTS],
-    double rhs[FBF_PREVIEW_SAMPLES])
-{
-    struct hybrid_learner *learner = &axis->hybrid;
-    struct affine_value nominal_history[HYBRID_NOMINAL_TERMS - 1];
-    struct affine_value residual_history[HYBRID_RESIDUAL_TERMS];
-    initialize_affine_histories(
-        nominal_scalar, residual_scalar, nominal_history, residual_history);
+    double nominal_history[HYBRID_NOMINAL_TERMS - 1]
+        [FBF_CURRENT_COEFFICIENTS] = {{0.}};
+    double residual_history[HYBRID_RESIDUAL_TERMS]
+        [FBF_CURRENT_COEFFICIENTS] = {{0.}};
 
     int row;
     for (row = 0; row < FBF_PREVIEW_SAMPLES; row++) {
-        struct affine_value nominal;
-        struct affine_value residual;
-        // Build yhat_pb(row)=b_pb(row)+a_pb(row)^T*gamma_C.
-        build_nominal_affine(axis, row, &nominal);
-        // Build ehat_pb(row)=b_e(row)+a_e(row)^T*gamma_C.
-        build_residual_affine(
-            learner, nominal_history, &nominal, residual_history, &residual);
+        const double *nominal = current_basis[row];
+        double residual[FBF_CURRENT_COEFFICIENTS] = {0.};
+        int index;
+        for (index = 0; index < HYBRID_NOMINAL_TERMS - 1; index++)
+            add_scaled_coefficients(
+                residual, nominal_history[index],
+                weights[1 + index]);
+        add_scaled_coefficients(
+            residual, nominal, weights[HYBRID_NOMINAL_TERMS]);
+        for (index = 0; index < HYBRID_RESIDUAL_TERMS; index++)
+            add_scaled_coefficients(
+                residual, residual_history[index],
+                weights[1 + HYBRID_NOMINAL_TERMS + index]);
 
-        // Build y_d(row)-b_h(row), where b_h=b_pb+b_e.
-        rhs[row] = desired[row] - nominal.offset - residual.offset;
         int column;
-        // Build A_h(row,:)=a_pb(row)^T+a_e(row)^T.
         for (column = 0; column < FBF_CURRENT_COEFFICIENTS; column++)
-            matrix[row][column] = nominal.coefficient[column]
-                + residual.coefficient[column];
-        // yhat_pb(row) becomes a past nominal prediction at row+1.
-        shift_affine_history(nominal_history,
-                             HYBRID_NOMINAL_TERMS - 1, &nominal);
-        // ehat_pb(row) becomes a past predicted residual at row+1.
-        shift_affine_history(residual_history,
-                             HYBRID_RESIDUAL_TERMS, &residual);
+            matrix[row][column] = nominal[column] + residual[column];
+        shift_coefficient_history(
+            nominal_history, HYBRID_NOMINAL_TERMS - 1, nominal);
+        shift_coefficient_history(
+            residual_history, HYBRID_RESIDUAL_TERMS, residual);
     }
 }
 
-/** Prepare delayed history, construct y_h=A_h*gamma_C+b_h, and solve. */
+/** Factor A_h once for the currently adopted immutable weight snapshot. */
+static int
+ensure_hybrid_factorization(struct fbf_axis *axis)
+{
+    struct hybrid_preview_factorization *factorization
+        = &axis->factorization_cache;
+    if (factorization->valid)
+        return 0;
+    build_hybrid_preview_matrix(
+        axis->applied_snapshot.weights, axis->filtered_current_basis,
+        factorization->q);
+    if (fbf_factorize_preview_matrix_qr(
+            factorization->q, factorization->r))
+        return -1;
+    factorization->valid = 1;
+    return 0;
+}
+
+/** Calculate b_pb(k), the nominal output fixed by committed coefficients. */
+static double
+calculate_nominal_offset(
+    const double committed_coefficients[FBF_HISTORY_COEFFICIENTS],
+    const double basis_row[FBF_HISTORY_COEFFICIENTS])
+{
+    double nominal = 0.;
+    int history_index;
+    for (history_index = 0;
+         history_index < FBF_HISTORY_COEFFICIENTS; history_index++)
+        nominal += committed_coefficients[history_index]
+            * basis_row[history_index];
+    return nominal;
+}
+
+/**
+ * Build rhs=r-b_h for one batch from its numeric past histories.
+ *
+ * Unlike A_h, b_h changes when start_index or committed coefficients change,
+ * so this inexpensive scalar recursion is intentionally evaluated every batch.
+ */
+static void
+build_hybrid_preview_rhs(
+    const double weights[HYBRID_FEATURES],
+    const double committed_coefficients[FBF_HISTORY_COEFFICIENTS],
+    const double history_basis
+        [FBF_PREVIEW_SAMPLES][FBF_HISTORY_COEFFICIENTS],
+    const double desired[],
+    double nominal_history[], double residual_history[], double rhs[])
+{
+    int row;
+    for (row = 0; row < FBF_PREVIEW_SAMPLES; row++) {
+        double nominal = calculate_nominal_offset(
+            committed_coefficients, history_basis[row]);
+        double residual = predict_scalar_residual(
+            weights, nominal_history, nominal, residual_history);
+        rhs[row] = desired[row] - nominal - residual;
+        shift_scalar_history(
+            nominal_history, HYBRID_NOMINAL_TERMS - 1, nominal);
+        shift_scalar_history(
+            residual_history, HYBRID_RESIDUAL_TERMS, residual);
+    }
+}
+
+/** Prepare numeric history, build rhs, and solve with cached QR(A_h). */
 int
 fbf_hybrid_solve_coefficients(struct fbf_controller *controller,
                               int axis_index, double start_time,
                               double desired[], double gamma[])
 {
     struct fbf_axis *axis = &controller->axis[axis_index];
-    struct hybrid_learner *learner = &axis->hybrid;
+    struct hybrid_snapshot *snapshot = &axis->applied_snapshot;
     // Signal the caller to use standard FBF until enough samples train w.
-    if (learner->training_samples < learner->warmup_samples)
+    if (snapshot->history_samples < controller->hybrid_warmup_samples)
+        return -1;
+    if (ensure_hybrid_factorization(axis))
         return -1;
 
     // Align numeric histories with the first sample of this preview window.
@@ -390,17 +627,15 @@ fbf_hybrid_solve_coefficients(struct fbf_controller *controller,
                                nominal_scalar, residual_scalar))
         return -1;
 
-    // Construct A_h and rhs=y_d-b_h for the hybrid least-squares problem.
-    double q[FBF_PREVIEW_SAMPLES][FBF_CURRENT_COEFFICIENTS];
-    double r[FBF_CURRENT_COEFFICIENTS][FBF_CURRENT_COEFFICIENTS];
     double rhs[FBF_PREVIEW_SAMPLES];
-    build_hybrid_preview_system(
-        axis, desired, nominal_scalar, residual_scalar, q, rhs);
+    build_hybrid_preview_rhs(
+        snapshot->weights, axis->history, axis->filtered_history_basis,
+        desired, nominal_scalar, residual_scalar, rhs);
 
     // Solve gamma_C=argmin ||A_h*gamma_C-(y_d-b_h)||_2 by QR.
-    if (fbf_factorize_preview_matrix_qr(q, r))
-        return -1;
-    fbf_solve_qr(q, r, rhs, gamma);
-    learner->hybrid_solves++;
+    struct hybrid_preview_factorization *factorization
+        = &axis->factorization_cache;
+    fbf_solve_qr(factorization->q, factorization->r, rhs, gamma);
+    axis->hybrid_solves++;
     return 0;
 }
