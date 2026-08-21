@@ -248,6 +248,11 @@ class DataLogger:
         db_status = self.db['status']
         for k, v in params.get("status", {}).items():
             db_status.setdefault(k, {}).update(v)
+        trinkey = params.get("status", {}).get("trinkey_accel", {})
+        if trinkey.get("reader_error"):
+            self.finish(
+                "ERROR: Trinkey stream failed: %s"
+                % (trinkey["reader_error"],), status=1)
         eventtime = params['eventtime']
         if eventtime >= self.next_index_time:
             self.next_index_time = eventtime + INDEX_UPDATE_TIME

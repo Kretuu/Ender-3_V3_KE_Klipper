@@ -38,6 +38,7 @@ ACK_BW_RE = re.compile(r'ACK_BW,(\d+),(\d+)')
 SERIAL_BAUD = 115200
 CONTROL_TIMEOUT = 5.0
 SYNC_TIMEOUT = 2.0
+STREAM_STALL_TIMEOUT = 3.0
 CONTROL_RETRY_INTERVAL = 0.500
 SERIAL_RECORD_LIMIT = 65536
 DEFAULT_API_UPDATE_INTERVAL = 0.100
@@ -297,6 +298,7 @@ class TrinkeyAccel:
         self.next_sync_sequence = 1
         self.sync_timer = None
         self.sync_timeouts = 0
+        self.last_data_host_time = None
         self.clock_mapper = TrinkeyClockMapper()
         self.sample_queues = {
             sensor: collections.deque(maxlen=self.max_host_samples)
@@ -476,9 +478,13 @@ class TrinkeyAccel:
         if self.serial_conn is None:
             raise self._command_error("Trinkey serial port is not open")
         data = (command + '\n').encode('ascii')
-        with self.write_lock:
-            self.serial_conn.write(data)
-            self.serial_conn.flush()
+        try:
+            with self.write_lock:
+                self.serial_conn.write(data)
+                self.serial_conn.flush()
+        except Exception as e:
+            raise self._command_error(
+                "Unable to send %s to Trinkey: %s" % (command, e))
 
     def _wait_for(
             self, predicate, timeout, message, raise_on_timeout=True):
@@ -528,6 +534,7 @@ class TrinkeyAccel:
         self.binary_mode = False
         self.streaming = False
         self.stream_start_pending = False
+        self.last_data_host_time = None
 
     def _recover_idle(self):
         # The previous logger may have exited while the firmware was emitting
@@ -640,6 +647,7 @@ class TrinkeyAccel:
                     % (ack,))
             self.streaming = True
             self.stream_start_pending = False
+            self.last_data_host_time = self.reactor.monotonic()
             self.sync_timer = self.reactor.register_timer(
                 self._sync_timer_event,
                 self.reactor.monotonic() + self.sync_interval)
@@ -714,6 +722,20 @@ class TrinkeyAccel:
                     continue
                 pending.extend(chunk)
                 while True:
+                    # STREAM_STOP normally ends with a binary stop frame.  If
+                    # that frame was damaged by USB backpressure, still accept
+                    # its following ASCII acknowledgement and recover framing.
+                    if (self.binary_mode
+                            and pending.startswith(b'ACK_STREAM_STOP,')):
+                        line_end = pending.find(b'\n')
+                        if line_end < 0:
+                            break
+                        line = bytes(pending[:line_end]).rstrip(b'\r').decode(
+                            'utf-8', 'replace')
+                        del pending[:line_end + 1]
+                        self.binary_mode = False
+                        self._handle_ascii_line(line, host_time)
+                        continue
                     delimiter = b'\x00' if self.binary_mode else b'\n'
                     end = pending.find(delimiter)
                     if end < 0:
@@ -782,7 +804,7 @@ class TrinkeyAccel:
                 raise ValueError("bad stream CRC")
             payload = raw[7:-4]
             if frame_type == STREAM_FRAME_DATA:
-                self._handle_data_frame(payload)
+                self._handle_data_frame(payload, host_time)
             elif frame_type == STREAM_FRAME_SYNC:
                 self._handle_sync_frame(payload, host_time)
             elif frame_type == STREAM_FRAME_STOP:
@@ -799,7 +821,7 @@ class TrinkeyAccel:
             self.frame_errors += 1
             logging.exception("Invalid Trinkey stream frame")
 
-    def _handle_data_frame(self, payload):
+    def _handle_data_frame(self, payload, host_time):
         if len(payload) < STREAM_DATA_HEADER.size:
             raise ValueError("short data frame")
         values = STREAM_DATA_HEADER.unpack_from(payload)
@@ -817,6 +839,7 @@ class TrinkeyAccel:
                 self.packet_sequence_errors += (
                     packet_sequence - expected_sequence) & 0xffffffff
         self.last_packet_sequence = packet_sequence
+        self.last_data_host_time = host_time
         self.firmware_status = {
             'sample_rate': sample_rate,
             'sensor_mask': sensor_mask,
@@ -891,6 +914,15 @@ class TrinkeyAccel:
         if not self.streaming or self.serial_conn is None:
             return self.reactor.NEVER
         host_before = self.reactor.monotonic()
+        if (self.last_data_host_time is not None
+                and host_before - self.last_data_host_time
+                    > STREAM_STALL_TIMEOUT):
+            self.reader_error = IOError(
+                "Trinkey stream produced no data for %.1f seconds"
+                % (host_before - self.last_data_host_time,))
+            with self.control_condition:
+                self.control_condition.notify_all()
+            return self.reactor.NEVER
         sequence = self.next_sync_sequence
         self.next_sync_sequence += 1
         with self.control_condition:
