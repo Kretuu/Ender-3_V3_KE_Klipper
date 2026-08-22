@@ -156,6 +156,23 @@ class MCU_stepper:
         ffi_main, ffi_lib = chelper.get_ffi()
         pos = ffi_lib.stepcompress_find_past_position(self._stepqueue, clock)
         return int(pos)
+    def get_past_mcu_positions(self, print_times):
+        """Return positions at sorted print times with one history traversal."""
+        count = len(print_times)
+        if not count:
+            return []
+        # Stepcompress history is stored newest-to-oldest, so present clocks
+        # in descending order and reverse the results back for the caller.
+        clocks = [self._mcu.print_time_to_clock(print_time)
+                  for print_time in reversed(print_times)]
+        ffi_main, ffi_lib = chelper.get_ffi()
+        clock_data = ffi_main.new('uint64_t[]', clocks)
+        position_data = ffi_main.new('int64_t[]', count)
+        if ffi_lib.stepcompress_find_past_positions(
+                self._stepqueue, clock_data, position_data, count):
+            raise RuntimeError("Invalid step history timestamp order")
+        return [int(position_data[index])
+                for index in range(count - 1, -1, -1)]
     def mcu_to_commanded_position(self, mcu_pos):
         return mcu_pos * self._step_dist - self._mcu_position_offset
     def dump_steps(self, count, start_clock, end_clock):

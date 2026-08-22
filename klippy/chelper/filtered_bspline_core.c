@@ -76,10 +76,10 @@ filter_local_basis_matrix(
 }
 
 /** Generate and DC-normalize the finite plant impulse response. */
-static int
-build_impulse_response(struct fbf_axis *axis, int numerator_count,
-                       double numerator[], int denominator_count,
-                       double denominator[])
+int
+fbf_build_impulse_response(double impulse[], int numerator_count,
+                           double numerator[], int denominator_count,
+                           double denominator[])
 {
     if (numerator_count < 1 || denominator_count < 1
         || fabs(denominator[0]) < 1.0e-15)
@@ -94,17 +94,17 @@ build_impulse_response(struct fbf_axis *axis, int numerator_count,
         for (order = 1; order < denominator_count && order <= sample;
              order++)
             value -= denominator[order] * inverse_a0
-                * axis->impulse[sample - order];
-        axis->impulse[sample] = value;
+                * impulse[sample - order];
+        impulse[sample] = value;
     }
 
     double truncated_dc_gain = 0.;
     for (sample = 0; sample < FBF_IMPULSE_SAMPLES; sample++)
-        truncated_dc_gain += axis->impulse[sample];
+        truncated_dc_gain += impulse[sample];
     if (fabs(truncated_dc_gain) < 1.0e-12)
         return -1;
     for (sample = 0; sample < FBF_IMPULSE_SAMPLES; sample++)
-        axis->impulse[sample] /= truncated_dc_gain;
+        impulse[sample] /= truncated_dc_gain;
     return 0;
 }
 
@@ -188,8 +188,8 @@ fbf_axis_configure_model(struct fbf_axis *axis, int numerator_count,
                          double denominator[])
 {
     memset(axis, 0, sizeof(*axis));
-    if (build_impulse_response(axis, numerator_count, numerator,
-                               denominator_count, denominator)
+    if (fbf_build_impulse_response(axis->impulse, numerator_count, numerator,
+                                   denominator_count, denominator)
         || build_filtered_basis_qr(axis))
         return -1;
     axis->configured = 1;

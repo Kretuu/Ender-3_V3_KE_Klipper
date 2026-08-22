@@ -1,7 +1,7 @@
 # Lightweight Motan logger
 
-This is a separate Motan variant for the dissertation acceleration prints. The
-stock logger remains in `scripts/motan` and is unchanged.
+This is the supported Motan variant for the dissertation acceleration prints.
+The stock logger remains generic and does not subscribe to the Trinkey stream.
 
 The lightweight logger records only:
 
@@ -34,8 +34,48 @@ python3 scripts/motan_lightweight/data_logger.py \
   /usr/data/printer_data/logs/motan/sine35_comp_r1
 ```
 
-Stop it with `Ctrl-C` after the print. It writes the standard Motan pair:
-`sine35_comp_r1.json.gz` and `sine35_comp_r1.index.gz`. The copied
+## Evaluation data collection procedure
+
+Each evaluation capture was started from an SSH session on the printer. A
+unique run name identified the motion frequency, controller and repetition:
+
+```sh
+RUN=sine35_hybrid_r4
+python3 /usr/share/klipper/scripts/motan_lightweight/data_logger.py \
+  /tmp/klippy_uds /usr/data/printer_data/logs/motan/${RUN}
+```
+
+The corresponding evaluation G-code was then started through the normal
+printer interface. The logger remained active until the print and all buffered
+motion had completed, and was stopped with `Ctrl-C`. Temporary warnings that a
+sensor produced no data for five seconds were recorded but were not, by
+themselves, used to reject a run. The timestamps, stream coverage and loss
+counters were checked afterwards.
+
+Two diagnostic files were saved immediately after every test:
+
+```sh
+dmesg | tail -n 200 > \
+  /usr/data/printer_data/logs/motan/${RUN}_dmesg.txt
+tail -n 1500 /usr/data/printer_data/logs/klippy.log > \
+  /usr/data/printer_data/logs/motan/${RUN}_klippy.log
+```
+
+The resulting Motan files and diagnostics were downloaded from a separate
+local shell. For example:
+
+```sh
+scp -O -r \
+  'root@192.168.0.2:/usr/data/printer_data/logs/motan/sine35_hybrid_r4*' \
+  ~/Downloads/evaluation
+```
+
+The `-O` option forces the legacy SCP protocol. It was required because the
+printer image did not provide an SFTP server, while recent OpenSSH clients use
+SFTP for `scp` by default.
+
+The logger writes the standard Motan pair: `sine35_comp_r1.json.gz` and
+`sine35_comp_r1.index.gz`. The copied
 `readlog.py`, `analyzers.py`, and `motan_graph.py` understand the same format.
 
 For hybrid captures, use an unambiguous prefix such as
@@ -63,11 +103,7 @@ the model-assisted estimate corrected by measured acceleration.
 measurement and on a sample following a timing discontinuity. `reference_valid`
 is zero if a delayed sample is outside the conservative usable-history limit or
 has no matching TrapQ move. Keep the printer stationary for at least 0.4 s
-after starting the logger. The old `command_x` and `command_y` acceleration
-selectors remain available for earlier captures.
-
-Do not run stock Motan and this lightweight logger at the same time. They are
-separate capture modes backed by the same Trinkey stream.
+after starting the logger.
 
 Use a unique log prefix for every run. The logger opens output files in write
 mode and will replace files that already have the same prefix.

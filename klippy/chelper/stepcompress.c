@@ -611,6 +611,26 @@ stepcompress_set_last_position(struct stepcompress *sc, uint64_t clock
     return 0;
 }
 
+// Calculate the position within one compressed step sequence.
+static int64_t
+history_position_at_clock(struct history_steps *hs, uint64_t clock)
+{
+    if (clock >= hs->last_clock)
+        return hs->start_position + hs->step_count;
+    int32_t interval = hs->interval, add = hs->add;
+    int32_t ticks = (int32_t)(clock - hs->first_clock) + interval, offset;
+    if (!add) {
+        offset = ticks / interval;
+    } else {
+        // Solve for "count" using quadratic formula
+        double a = .5 * add, b = interval - .5 * add, c = -ticks;
+        offset = (sqrt(b*b - 4*a*c) - b) / (2. * a);
+    }
+    if (hs->step_count < 0)
+        return hs->start_position - offset;
+    return hs->start_position + offset;
+}
+
 // Search history of moves to find a past position at a given clock
 int64_t __visible
 stepcompress_find_past_position(struct stepcompress *sc, uint64_t clock)
@@ -622,22 +642,42 @@ stepcompress_find_past_position(struct stepcompress *sc, uint64_t clock)
             last_position = hs->start_position;
             continue;
         }
-        if (clock >= hs->last_clock)
-            return hs->start_position + hs->step_count;
-        int32_t interval = hs->interval, add = hs->add;
-        int32_t ticks = (int32_t)(clock - hs->first_clock) + interval, offset;
-        if (!add) {
-            offset = ticks / interval;
-        } else {
-            // Solve for "count" using quadratic formula
-            double a = .5 * add, b = interval - .5 * add, c = -ticks;
-            offset = (sqrt(b*b - 4*a*c) - b) / (2. * a);
-        }
-        if (hs->step_count < 0)
-            return hs->start_position - offset;
-        return hs->start_position + offset;
+        return history_position_at_clock(hs, clock);
     }
     return last_position;
+}
+
+// Find positions for clocks sorted newest-to-oldest with one history walk.
+int __visible
+stepcompress_find_past_positions(struct stepcompress *sc, uint64_t clocks[],
+                                 int64_t positions[], int count)
+{
+    if (count < 0)
+        return -1;
+    struct list_node *node = sc->history_list.root.next;
+    int64_t last_position = sc->last_position;
+    uint64_t previous_clock = UINT64_MAX;
+    int index;
+    for (index = 0; index < count; index++) {
+        uint64_t clock = clocks[index];
+        if (clock > previous_clock)
+            return -1;
+        previous_clock = clock;
+        while (node != &sc->history_list.root) {
+            struct history_steps *hs = container_of(
+                node, struct history_steps, node);
+            if (clock < hs->first_clock) {
+                last_position = hs->start_position;
+                node = node->next;
+                continue;
+            }
+            positions[index] = history_position_at_clock(hs, clock);
+            break;
+        }
+        if (node == &sc->history_list.root)
+            positions[index] = last_position;
+    }
+    return 0;
 }
 
 // Queue an mcu command to go out in order with stepper commands

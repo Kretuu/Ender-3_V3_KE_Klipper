@@ -23,6 +23,8 @@ STATUS_OBJECTS = {
         'file_path', 'progress', 'is_active', 'file_position', 'file_size'],
     'filtered_bspline': [
         'enabled', 'mode', 'hybrid_observation_errors',
+        'hybrid_worker_queue', 'hybrid_worker_queue_max',
+        'hybrid_worker_drops', 'hybrid_worker_alive',
         'hybrid_x', 'hybrid_y'],
     'toolhead': ['print_time', 'estimated_print_time', 'stalls'],
     'system_stats': ['sysload', 'cputime', 'memavail'],
@@ -98,6 +100,16 @@ class DataLogger:
         sys.stderr.write(msg + "\n")
     def finish(self, msg, status=0):
         self.error(msg)
+        # Notify Klipper that the streaming client is gone before potentially
+        # slow gzip finalization, so its STREAM_STOP handshake starts promptly.
+        try:
+            self.poll.unregister(self.webhook_socket)
+        except Exception:
+            pass
+        try:
+            self.webhook_socket.close()
+        except Exception:
+            pass
         self.logger.close()
         self.index.close()
         sys.exit(status)
@@ -236,6 +248,11 @@ class DataLogger:
         db_status = self.db['status']
         for k, v in params.get("status", {}).items():
             db_status.setdefault(k, {}).update(v)
+        trinkey = params.get("status", {}).get("trinkey_accel", {})
+        if trinkey.get("reader_error"):
+            self.finish(
+                "ERROR: Trinkey stream failed: %s"
+                % (trinkey["reader_error"],), status=1)
         eventtime = params['eventtime']
         if eventtime >= self.next_index_time:
             self.next_index_time = eventtime + INDEX_UPDATE_TIME

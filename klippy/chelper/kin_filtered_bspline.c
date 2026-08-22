@@ -40,16 +40,31 @@ static void
 sample_desired_window(struct trapq *tq, double start_time,
                       double desired[FBF_AXIS_COUNT][FBF_PREVIEW_SAMPLES])
 {
+    // Preview times are monotonic.  Walk TrapQ once instead of restarting at
+    // its head for every one of the 140 samples.
+    trapq_check_sentinels(tq);
+    struct move *head = list_first_entry(&tq->moves, struct move, node);
+    struct move *tail = list_last_entry(&tq->moves, struct move, node);
+    struct move *move = list_next_entry(head, node);
     int sample;
     for (sample = 0; sample < FBF_PREVIEW_SAMPLES; sample++) {
-        struct coord position = get_desired_position(
-            tq, start_time + sample * FBF_SAMPLE_TIME);
+        double print_time = start_time + sample * FBF_SAMPLE_TIME;
+        while (move != tail
+               && print_time >= move->print_time + move->move_t)
+            move = list_next_entry(move, node);
+        struct coord position;
+        if (move == tail)
+            position = tail->start_pos;
+        else if (print_time <= move->print_time)
+            position = move->start_pos;
+        else
+            position = move_get_coord(move, print_time - move->print_time);
         desired[0][sample] = position.x;
         desired[1][sample] = position.y;
     }
 }
 
-/** Remove batches only after command generation and hybrid training pass them. */
+/** Remove batches after command generation and hybrid training pass them. */
 static void
 discard_old_batches(struct fbf_controller *controller, double start_time)
 {
@@ -57,14 +72,14 @@ discard_old_batches(struct fbf_controller *controller, double start_time)
     if (controller->mode == FBF_MODE_HYBRID) {
         int axis_index;
         for (axis_index = 0; axis_index < FBF_AXIS_COUNT; axis_index++) {
-            struct hybrid_learner *learner
-                = &controller->axis[axis_index].hybrid;
-            if (learner->latest_sample_index < 0) {
+            struct hybrid_snapshot *snapshot
+                = &controller->axis[axis_index].applied_snapshot;
+            if (snapshot->latest_sample_index < 0) {
                 discard_before = controller->trajectory_start_time;
                 break;
             }
             double measured_time = controller->trajectory_start_time
-                + learner->latest_sample_index * FBF_SAMPLE_TIME;
+                + snapshot->latest_sample_index * FBF_SAMPLE_TIME;
             if (axis_index == 0 || measured_time < discard_before)
                 discard_before = measured_time;
         }
@@ -74,6 +89,10 @@ discard_old_batches(struct fbf_controller *controller, double start_time)
             &controller->batches, struct fbf_batch, node);
         if (batch->start_time + FBF_BATCH_TIME >= discard_before)
             break;
+        int axis_index;
+        for (axis_index = 0; axis_index < FBF_AXIS_COUNT; axis_index++)
+            if (controller->nominal_cache[axis_index] == batch)
+                controller->nominal_cache[axis_index] = NULL;
         list_del(&batch->node);
         free(batch);
     }
@@ -100,9 +119,9 @@ prepare_batch(struct fbf_controller *controller, struct trapq *tq)
                 desired[axis_index], gamma[axis_index]);
         if (hybrid_result) {
             if (controller->mode == FBF_MODE_HYBRID
-                && axis->hybrid.training_samples
-                   >= axis->hybrid.warmup_samples)
-                axis->hybrid.solve_fallbacks++;
+                && axis->applied_snapshot.history_samples
+                   >= controller->hybrid_warmup_samples)
+                axis->solve_fallbacks++;
             fbf_solve_standard_coefficients(
                 axis, desired[axis_index], gamma[axis_index]);
         }
@@ -147,10 +166,7 @@ initialize_trajectory(struct fbf_controller *controller, struct trapq *tq,
         for (history_index = 0;
              history_index < FBF_HISTORY_COEFFICIENTS; history_index++)
             controller->axis[axis_index].history[history_index] = value;
-        fbf_hybrid_reset(
-            &controller->axis[axis_index], value,
-            controller->hybrid_regularization,
-            controller->hybrid_warmup_samples);
+        fbf_hybrid_reset_prediction(&controller->axis[axis_index]);
     }
     // Define t(k)=start_time+k*T_s for this continuous controller trajectory.
     controller->trajectory_start_time = start_time;
@@ -170,7 +186,7 @@ filtered_bspline_controller_alloc(void)
     if (!controller)
         return NULL;
     memset(controller, 0, sizeof(*controller));
-    controller->hybrid_regularization = 0.01;
+    controller->generation = 1;
     controller->hybrid_warmup_samples = 5500;
     list_init(&controller->batches);
     return controller;
@@ -179,6 +195,7 @@ filtered_bspline_controller_alloc(void)
 void __visible
 filtered_bspline_controller_reset(struct fbf_controller *controller)
 {
+    memset(controller->nominal_cache, 0, sizeof(controller->nominal_cache));
     while (!list_empty(&controller->batches)) {
         struct fbf_batch *batch = list_first_entry(
             &controller->batches, struct fbf_batch, node);
@@ -186,6 +203,7 @@ filtered_bspline_controller_reset(struct fbf_controller *controller)
         free(batch);
     }
     controller->initialized = 0;
+    controller->generation++;
     // A new trajectory resets the numerical learner state.  Keep the previous
     // run's counters visible between ENABLE=0 and the next trajectory.
 }
@@ -228,7 +246,6 @@ filtered_bspline_configure_hybrid(struct fbf_controller *controller,
     if (!isfinite(regularization) || regularization <= 0.
         || warmup_samples < HYBRID_RESIDUAL_TERMS)
         return -1;
-    controller->hybrid_regularization = regularization;
     controller->hybrid_warmup_samples = warmup_samples;
     return 0;
 }
@@ -252,117 +269,86 @@ filtered_bspline_set_enabled(struct fbf_controller *controller, int enabled)
         controller, enabled ? FBF_MODE_STANDARD : FBF_MODE_DISABLED);
 }
 
-/** Start a continuous observation segment without inventing missing data. */
-static int
-restart_observation_segment(struct fbf_controller *controller, int axis_index,
-                            double print_time, double observed_position)
+/** Publish one immutable learner result into reactor-owned prediction state. */
+int __visible
+filtered_bspline_apply_hybrid_snapshot(
+    struct fbf_controller *controller, char axis, long long latest_sample_index,
+    int history_samples, int training_samples, int measurement_errors,
+    double weights[], double nominal_history[], double residual_history[])
 {
-    struct hybrid_learner *learner = &controller->axis[axis_index].hybrid;
-    long long sample_index = floor(
-        (print_time - controller->trajectory_start_time) / FBF_SAMPLE_TIME);
-    double sample_time = controller->trajectory_start_time
-        + sample_index * FBF_SAMPLE_TIME;
-    double nominal;
-    if (sample_index < 0 || fbf_hybrid_lookup_nominal_prediction(
-            controller, axis_index, sample_time, &nominal))
+    if ((axis != 'x' && axis != 'y') || latest_sample_index < 0
+        || history_samples < 0 || training_samples < 0
+        || measurement_errors < 0)
         return -1;
-    int index;
-    for (index = 0; index < HYBRID_NOMINAL_TERMS - 1; index++)
-        learner->nominal_history[index] = nominal;
-    memset(learner->residual_history, 0,
-           sizeof(learner->residual_history));
-    learner->residual_history[HYBRID_RESIDUAL_TERMS - 1]
-        = observed_position - nominal;
-    learner->latest_sample_index = sample_index;
-    learner->last_observation_time = print_time;
-    learner->last_observed_position = observed_position;
-    learner->have_observation = 1;
+    struct fbf_axis *axis_data = &controller->axis[axis - 'x'];
+    struct hybrid_snapshot *snapshot = &axis_data->applied_snapshot;
+    if (latest_sample_index < snapshot->latest_sample_index)
+        return 0;
+    snapshot->latest_sample_index = latest_sample_index;
+    snapshot->history_samples = history_samples;
+    snapshot->training_samples = training_samples;
+    snapshot->measurement_errors = measurement_errors;
+    memcpy(snapshot->weights, weights, sizeof(snapshot->weights));
+    memcpy(snapshot->nominal_history, nominal_history,
+           sizeof(snapshot->nominal_history));
+    memcpy(snapshot->residual_history, residual_history,
+           sizeof(snapshot->residual_history));
+    fbf_hybrid_invalidate_snapshot_caches(axis_data);
     return 0;
 }
 
-/** Causally resample completed 250 Hz observations onto the 1 kHz FBF grid. */
-int __visible
-filtered_bspline_add_observation(struct fbf_controller *controller, char axis,
-                                 double print_time, double observed_position)
+void __visible
+filtered_bspline_clear_hybrid_snapshot(struct fbf_controller *controller,
+                                       char axis)
 {
-    if ((axis != 'x' && axis != 'y') || !isfinite(print_time)
-        || !isfinite(observed_position))
-        return -1;
-    if (controller->mode != FBF_MODE_HYBRID || !controller->initialized)
-        return 0;
-    if (print_time < controller->trajectory_start_time - FBF_TIME_EPSILON)
-        return 0;
-    int axis_index = axis - 'x';
-    struct fbf_axis *axis_data = &controller->axis[axis_index];
-    struct hybrid_learner *learner = &axis_data->hybrid;
-    if (!learner->have_observation)
-        return restart_observation_segment(
-            controller, axis_index, print_time, observed_position);
+    if (axis != 'x' && axis != 'y')
+        return;
+    struct fbf_axis *axis_data = &controller->axis[axis - 'x'];
+    struct hybrid_snapshot *snapshot = &axis_data->applied_snapshot;
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->latest_sample_index = -1;
+    fbf_hybrid_invalidate_snapshot_caches(axis_data);
+}
 
-    double interval = print_time - learner->last_observation_time;
-    if (interval <= 0. || interval > HYBRID_MAX_OBSERVATION_GAP) {
-        learner->measurement_errors++;
-        return restart_observation_segment(
-            controller, axis_index, print_time, observed_position);
-    }
-
-    long long last_index = floor(
-        (print_time - controller->trajectory_start_time) / FBF_SAMPLE_TIME
-        + FBF_TIME_EPSILON);
-    long long sample_index;
-    for (sample_index = learner->latest_sample_index + 1;
-         sample_index <= last_index; sample_index++) {
-        double sample_time = controller->trajectory_start_time
-            + sample_index * FBF_SAMPLE_TIME;
-        if (sample_time <= learner->last_observation_time
-            + FBF_TIME_EPSILON)
-            continue;
-        double fraction = (sample_time - learner->last_observation_time)
-            / interval;
-        if (fraction > 1. + FBF_TIME_EPSILON)
-            break;
-        double observed = learner->last_observed_position
-            + fraction * (observed_position
-                          - learner->last_observed_position);
-        double nominal;
-        if (fbf_hybrid_lookup_nominal_prediction(
-                controller, axis_index, sample_time, &nominal)) {
-            learner->measurement_errors++;
-            return restart_observation_segment(
-                controller, axis_index, print_time, observed_position);
-        }
-        if (fbf_hybrid_train_residual_sample(
-                axis_data, nominal, observed - nominal, sample_index))
-            return -2;
-    }
-    learner->last_observation_time = print_time;
-    learner->last_observed_position = observed_position;
+int __visible
+filtered_bspline_get_trajectory(struct fbf_controller *controller,
+                                int *initialized,
+                                double *trajectory_start_time)
+{
+    *initialized = controller->initialized;
+    *trajectory_start_time = controller->trajectory_start_time;
     return 0;
 }
 
 int __visible
 filtered_bspline_get_hybrid_status(
-    struct fbf_controller *controller, char axis, int *training_samples,
-    int *active, int *measurement_errors, int *solve_fallbacks,
+    struct fbf_controller *controller, char axis, int *history_samples,
+    int *training_samples, int *active, int *measurement_errors,
+    int *solve_fallbacks,
     int *hybrid_solves, int *prediction_gap_samples,
-    int *maximum_prediction_gap_samples, double *weight_norm)
+    int *maximum_prediction_gap_samples, int *history_replay_samples,
+    int *maximum_history_replay_samples, double *weight_norm)
 {
     if (axis != 'x' && axis != 'y')
         return -1;
-    struct hybrid_learner *learner = &controller->axis[axis - 'x'].hybrid;
-    *training_samples = learner->training_samples;
-    *active = learner->warmup_samples > 0
-        && learner->training_samples >= learner->warmup_samples;
-    *measurement_errors = learner->measurement_errors;
-    *solve_fallbacks = learner->solve_fallbacks;
-    *hybrid_solves = learner->hybrid_solves;
-    *prediction_gap_samples = learner->prediction_gap_samples;
+    struct fbf_axis *axis_data = &controller->axis[axis - 'x'];
+    struct hybrid_snapshot *snapshot = &axis_data->applied_snapshot;
+    *history_samples = snapshot->history_samples;
+    *training_samples = snapshot->training_samples;
+    *active = snapshot->history_samples >= controller->hybrid_warmup_samples;
+    *measurement_errors = snapshot->measurement_errors;
+    *solve_fallbacks = axis_data->solve_fallbacks;
+    *hybrid_solves = axis_data->hybrid_solves;
+    *prediction_gap_samples = axis_data->prediction_gap_samples;
     *maximum_prediction_gap_samples
-        = learner->maximum_prediction_gap_samples;
+        = axis_data->maximum_prediction_gap_samples;
+    *history_replay_samples = axis_data->history_replay_samples;
+    *maximum_history_replay_samples
+        = axis_data->maximum_history_replay_samples;
     double squared_norm = 0.;
     int index;
     for (index = 0; index < HYBRID_FEATURES; index++)
-        squared_norm += learner->weights[index] * learner->weights[index];
+        squared_norm += snapshot->weights[index] * snapshot->weights[index];
     *weight_norm = sqrt(squared_norm);
     return 0;
 }
@@ -423,6 +409,30 @@ get_prepared_position(struct fbf_controller *controller, int axis_index,
     return -1;
 }
 
+static int
+get_cached_position(double start_time, double samples[], double print_time,
+                    double *position)
+{
+    double relative_time = print_time - start_time;
+    if (relative_time < -FBF_TIME_EPSILON
+        || relative_time > FBF_BATCH_TIME + FBF_TIME_EPSILON)
+        return -1;
+    double sample_position = relative_time / FBF_SAMPLE_TIME;
+    if (sample_position <= 0.) {
+        *position = samples[0];
+        return 0;
+    }
+    if (sample_position >= FBF_BATCH_SAMPLES) {
+        *position = samples[FBF_BATCH_SAMPLES];
+        return 0;
+    }
+    int sample = floor(sample_position);
+    double fraction = sample_position - sample;
+    *position = samples[sample]
+        + fraction * (samples[sample + 1] - samples[sample]);
+    return 0;
+}
+
 int __visible
 filtered_bspline_get_position(struct fbf_controller *controller, char axis,
                               double print_time, double *position)
@@ -445,7 +455,33 @@ struct filtered_bspline_stepper {
     struct stepper_kinematics *orig_sk;
     struct fbf_controller *controller;
     struct move dummy_move;
+    unsigned int cached_generation;
+    int cache_valid;
+    double cached_start_time;
+    double cached_position[FBF_AXIS_COUNT][FBF_BATCH_SAMPLES + 1];
 };
+
+static int
+cache_prepared_batch(struct filtered_bspline_stepper *wrapper,
+                     double print_time)
+{
+    struct fbf_controller *controller = wrapper->controller;
+    struct fbf_batch *batch;
+    list_for_each_entry(batch, &controller->batches, node) {
+        double relative_time = print_time - batch->start_time;
+        if (relative_time < -FBF_TIME_EPSILON
+            || relative_time > FBF_BATCH_TIME + FBF_TIME_EPSILON)
+            continue;
+        wrapper->cached_start_time = batch->start_time;
+        memcpy(wrapper->cached_position, batch->position,
+               sizeof(wrapper->cached_position));
+        wrapper->cached_generation = controller->generation;
+        wrapper->cache_valid = 1;
+        return 0;
+    }
+    wrapper->cache_valid = 0;
+    return -1;
+}
 
 static double
 filtered_bspline_calc_position(struct stepper_kinematics *sk,
@@ -460,13 +496,23 @@ filtered_bspline_calc_position(struct stepper_kinematics *sk,
 
     struct coord position = move_get_coord(move, move_time);
     double print_time = move->print_time + move_time;
+    if (!wrapper->cache_valid
+        || wrapper->cached_generation != controller->generation
+        || print_time < wrapper->cached_start_time - FBF_TIME_EPSILON
+        || print_time > wrapper->cached_start_time + FBF_BATCH_TIME
+                        + FBF_TIME_EPSILON)
+        cache_prepared_batch(wrapper, print_time);
     int found = 0;
-    if (sk->active_flags & AF_X)
-        found |= !get_prepared_position(
-            controller, 0, print_time, &position.x);
-    if (sk->active_flags & AF_Y)
-        found |= !get_prepared_position(
-            controller, 1, print_time, &position.y);
+    if (wrapper->cache_valid) {
+        if (sk->active_flags & AF_X)
+            found |= !get_cached_position(
+                wrapper->cached_start_time, wrapper->cached_position[0],
+                print_time, &position.x);
+        if (sk->active_flags & AF_Y)
+            found |= !get_cached_position(
+                wrapper->cached_start_time, wrapper->cached_position[1],
+                print_time, &position.y);
+    }
     if (!found)
         return wrapper->orig_sk->calc_position_cb(
             wrapper->orig_sk, move, move_time);

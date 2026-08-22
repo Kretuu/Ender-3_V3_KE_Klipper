@@ -50,6 +50,8 @@ defs_stepcompress = """
         , uint64_t clock, int64_t last_position);
     int64_t stepcompress_find_past_position(struct stepcompress *sc
         , uint64_t clock);
+    int stepcompress_find_past_positions(struct stepcompress *sc
+        , uint64_t clocks[], int64_t positions[], int count);
     int stepcompress_queue_msg(struct stepcompress *sc
         , uint32_t *data, int len);
     int stepcompress_extract_old(struct stepcompress *sc
@@ -158,6 +160,26 @@ defs_kin_shaper = """
 
 defs_kin_filtered_bspline = """
     struct fbf_controller *filtered_bspline_controller_alloc(void);
+    struct fbf_hybrid_learner *filtered_bspline_learner_alloc(void);
+    void filtered_bspline_learner_free(
+        struct fbf_hybrid_learner *learner);
+    int filtered_bspline_learner_configure_axis(
+        struct fbf_hybrid_learner *learner, char axis
+        , int numerator_count, double numerator[]
+        , int denominator_count, double denominator[]);
+    int filtered_bspline_learner_configure(
+        struct fbf_hybrid_learner *learner, double regularization
+        , int warmup_samples);
+    int filtered_bspline_learner_add_observation(
+        struct fbf_hybrid_learner *learner, char axis
+        , unsigned int generation, double trajectory_start_time
+        , double print_time, double motor_position, double observed_position);
+    int filtered_bspline_learner_get_snapshot(
+        struct fbf_hybrid_learner *learner, char axis, int *history_samples
+        , int *training_samples, int *measurement_errors
+        , long long *latest_sample_index
+        , double weights[], double nominal_history[]
+        , double residual_history[]);
     void filtered_bspline_controller_free(struct fbf_controller *controller);
     void filtered_bspline_controller_reset(struct fbf_controller *controller);
     int filtered_bspline_configure_axis(struct fbf_controller *controller
@@ -170,13 +192,23 @@ defs_kin_filtered_bspline = """
     int filtered_bspline_set_mode(struct fbf_controller *controller, int mode);
     void filtered_bspline_set_enabled(struct fbf_controller *controller
         , int enabled);
-    int filtered_bspline_add_observation(struct fbf_controller *controller
-        , char axis, double print_time, double observed_position);
+    int filtered_bspline_apply_hybrid_snapshot(
+        struct fbf_controller *controller, char axis
+        , long long latest_sample_index, int history_samples
+        , int training_samples
+        , int measurement_errors, double weights[]
+        , double nominal_history[], double residual_history[]);
+    void filtered_bspline_clear_hybrid_snapshot(
+        struct fbf_controller *controller, char axis);
+    int filtered_bspline_get_trajectory(struct fbf_controller *controller
+        , int *initialized, double *trajectory_start_time);
     int filtered_bspline_get_hybrid_status(
-        struct fbf_controller *controller, char axis, int *training_samples
-        , int *active, int *measurement_errors, int *solve_fallbacks
+        struct fbf_controller *controller, char axis, int *history_samples
+        , int *training_samples, int *active, int *measurement_errors
+        , int *solve_fallbacks
         , int *hybrid_solves, int *prediction_gap_samples
-        , int *maximum_prediction_gap_samples, double *weight_norm);
+        , int *maximum_prediction_gap_samples, int *history_replay_samples
+        , int *maximum_history_replay_samples, double *weight_norm);
     int filtered_bspline_prepare(struct fbf_controller *controller
         , struct trapq *tq, double start_time, double end_time, int is_final);
     int filtered_bspline_get_position(struct fbf_controller *controller
@@ -192,7 +224,8 @@ defs_kin_filtered_bspline = """
 defs_state_space_observer = """
     struct state_space_observer *state_space_observer_alloc(
         int state_count, double fo[], double gu[], double gv[], double ga[]
-        , double ho[], double x0_per_unit[]);
+        , double ho[], double hu, double hv, double ha
+        , double x0_per_unit[]);
     void state_space_observer_free(struct state_space_observer *observer);
     void state_space_observer_reset(struct state_space_observer *observer);
     double state_space_observer_sample(struct state_space_observer *observer

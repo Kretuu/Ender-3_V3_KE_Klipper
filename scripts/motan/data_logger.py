@@ -157,19 +157,6 @@ class DataLogger:
                 aname = cfgname.split()[-1]
                 self.send_subscribe("adxl345:" + aname, "adxl345/dump_adxl345",
                                     {"sensor": aname})
-            if cfgname == "trinkey_accel":
-                sensors = config[cfgname].get(
-                    "sensors", ["base", "toolhead"])
-                if isinstance(sensors, str):
-                    sensors = sensors.replace(',', ' ').split()
-                for sensor in sensors:
-                    sensor = str(sensor).strip().lower()
-                    if sensor not in ("base", "toolhead"):
-                        continue
-                    self.send_subscribe(
-                        "trinkey_accel:" + sensor,
-                        "trinkey_accel/dump_trinkey_accel",
-                        {"sensor": sensor})
             if cfgname.startswith("angle "):
                 aname = cfgname.split()[1]
                 self.send_subscribe("angle:" + aname, "angle/dump_angle",

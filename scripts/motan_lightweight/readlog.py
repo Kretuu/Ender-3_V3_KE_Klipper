@@ -407,10 +407,6 @@ class HandleTrinkeyAccel:
          'Signed and bias-corrected observer acceleration input'),
         ('trinkey_accel(<sensor>,observer_valid)',
          'Whether the observer sample follows a valid fixed-rate sample'),
-        ('trinkey_accel(toolhead,command_x)',
-         'Legacy alias for nominal toolhead X acceleration'),
-        ('trinkey_accel(base,command_y)',
-         'Legacy alias for nominal toolhead Y acceleration'),
         ('trinkey_accel(<sensor>,reference_valid)',
          'Whether the command reference remains inside TrapQ history'),
     ]
@@ -419,19 +415,11 @@ class HandleTrinkeyAccel:
         self.sensor_name = name_parts[1]
         self.jdispatch = lmanager.get_jdispatch()
         subscriptions = lmanager.get_log_subscriptions()
-        combined_id = 'trinkey_accel:experiment'
-        legacy_id = 'trinkey_accel:' + self.sensor_name
-        if combined_id in subscriptions:
-            self.combined = True
-            subscription_id = combined_id
-            headers = subscriptions[combined_id].get('headers', {})
-            header = headers.get(self.sensor_name, ())
-        elif legacy_id in subscriptions:
-            self.combined = False
-            subscription_id = legacy_id
-            header = subscriptions[legacy_id].get('header', ())
-        else:
-            raise error("Dataset '%s' not in capture" % (legacy_id,))
+        subscription_id = 'trinkey_accel:experiment'
+        if subscription_id not in subscriptions:
+            raise error("Dataset '%s' not in capture" % (subscription_id,))
+        headers = subscriptions[subscription_id].get('headers', {})
+        header = headers.get(self.sensor_name, ())
         self.jdispatch.add_handler(name, subscription_id)
         self.next_time = self.last_time = 0.
         self.next_row = self.last_row = (0.,) * max(1, len(header))
@@ -469,23 +457,7 @@ class HandleTrinkeyAccel:
             'observer_valid': ('observer_valid', 'Observer valid'),
             'reference_valid': ('reference_valid', 'Reference valid'),
         }
-        # Retain the dataset names used by acceleration-only captures.  The
-        # first matching column makes old and new log formats both readable.
-        legacy_columns = {
-            'command_x': (
-                ('command_x_acceleration', 'desired_x_acceleration'),
-                'Acceleration\n(mm/s^2)'),
-            'command_y': (
-                ('command_y_acceleration', 'desired_y_acceleration'),
-                'Acceleration\n(mm/s^2)'),
-        }
-        if selection in legacy_columns:
-            columns, units = legacy_columns[selection]
-            column = next((candidate for candidate in columns
-                           if candidate in header), columns[0])
-            info = (column, units)
-        else:
-            info = selectors.get(selection)
+        info = selectors.get(selection)
         if info is None:
             raise error("Unknown trinkey_accel data selection '%s'" % (name,))
         column, units = info
@@ -513,10 +485,7 @@ class HandleTrinkeyAccel:
                 jmsg = self.jdispatch.pull_msg(req_time, self.name)
                 if jmsg is None:
                     return 0.
-                if self.combined:
-                    self.cur_data = jmsg.get(self.sensor_name, [])
-                else:
-                    self.cur_data = jmsg.get('data', [])
+                self.cur_data = jmsg.get(self.sensor_name, [])
                 self.data_pos = 0
                 continue
             self.last_row = self.next_row

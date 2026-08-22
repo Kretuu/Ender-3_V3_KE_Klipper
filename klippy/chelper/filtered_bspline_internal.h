@@ -38,18 +38,48 @@
 #define FBF_MODE_STANDARD 1
 #define FBF_MODE_HYBRID 2
 
-struct hybrid_learner {
-    double regularization;
-    int warmup_samples;
-    int training_samples, measurement_errors, solve_fallbacks, hybrid_solves;
-    int prediction_gap_samples, maximum_prediction_gap_samples;
+struct hybrid_snapshot {
+    int history_samples, training_samples, measurement_errors;
     double weights[HYBRID_FEATURES];
-    double covariance[HYBRID_FEATURES][HYBRID_FEATURES];
     double nominal_history[HYBRID_NOMINAL_TERMS - 1];
     double residual_history[HYBRID_RESIDUAL_TERMS];
     long long latest_sample_index;
+};
+
+// Numeric residual history propagated from one adopted learner snapshot.
+struct hybrid_prediction_cache {
+    int valid;
+    long long latest_sample_index;
+    double nominal_history[HYBRID_NOMINAL_TERMS - 1];
+    double residual_history[HYBRID_RESIDUAL_TERMS];
+};
+
+// QR(A_h) for the currently adopted weights.  A_h depends on the weights and
+// fixed B-spline basis, but not on the batch time or numeric past histories.
+struct hybrid_preview_factorization {
+    int valid;
+    double q[FBF_PREVIEW_SAMPLES][FBF_CURRENT_COEFFICIENTS];
+    double r[FBF_CURRENT_COEFFICIENTS][FBF_CURRENT_COEFFICIENTS];
+};
+
+struct hybrid_training_axis {
+    int configured;
+    double impulse[FBF_IMPULSE_SAMPLES];
+    double command_history[FBF_IMPULSE_SAMPLES];
+    double covariance[HYBRID_FEATURES][HYBRID_FEATURES];
+    struct hybrid_snapshot snapshot;
     int have_observation;
-    double last_observation_time, last_observed_position;
+    double last_observation_time;
+    double last_motor_position, last_observed_position;
+};
+
+// Private to the learner thread.  The motion controller never reads it.
+struct fbf_hybrid_learner {
+    double regularization;
+    unsigned int generation;
+    int initialized;
+    double trajectory_start_time;
+    struct hybrid_training_axis axis[FBF_AXIS_COUNT];
 };
 
 struct fbf_axis {
@@ -62,7 +92,12 @@ struct fbf_axis {
     double q[FBF_PREVIEW_SAMPLES][FBF_CURRENT_COEFFICIENTS];
     double r[FBF_CURRENT_COEFFICIENTS][FBF_CURRENT_COEFFICIENTS];
     double history[FBF_HISTORY_COEFFICIENTS];
-    struct hybrid_learner hybrid;
+    struct hybrid_snapshot applied_snapshot;
+    struct hybrid_prediction_cache prediction_cache;
+    struct hybrid_preview_factorization factorization_cache;
+    int solve_fallbacks, hybrid_solves;
+    int prediction_gap_samples, maximum_prediction_gap_samples;
+    int history_replay_samples, maximum_history_replay_samples;
 };
 
 struct fbf_batch {
@@ -74,16 +109,19 @@ struct fbf_batch {
 
 struct fbf_controller {
     int mode, initialized;
+    // Incremented whenever prepared batches are invalidated.  Kinematics
+    // wrappers use it to reject copied lookup caches after a coordinate reset.
+    unsigned int generation;
     // Fixed print-time origin for k=0 on the hybrid 1 kHz sample grid.  It is
     // set once per continuous controller trajectory and does not advance with
     // individual G-code moves or FBF batches.
     double trajectory_start_time;
     // Absolute print time of the next 70 ms batch; advances after every solve.
     double next_batch_time;
-    double hybrid_regularization;
     int hybrid_warmup_samples;
     double position_min[FBF_AXIS_COUNT], position_max[FBF_AXIS_COUNT];
     struct fbf_axis axis[FBF_AXIS_COUNT];
+    struct fbf_batch *nominal_cache[FBF_AXIS_COUNT];
     struct list_head batches;
 };
 
@@ -91,6 +129,9 @@ struct fbf_controller {
 int fbf_axis_configure_model(struct fbf_axis *axis, int numerator_count,
                              double numerator[], int denominator_count,
                              double denominator[]);
+int fbf_build_impulse_response(double impulse[], int numerator_count,
+                               double numerator[], int denominator_count,
+                               double denominator[]);
 int fbf_factorize_preview_matrix_qr(
     double q[FBF_PREVIEW_SAMPLES][FBF_CURRENT_COEFFICIENTS],
     double r[FBF_CURRENT_COEFFICIENTS][FBF_CURRENT_COEFFICIENTS]);
@@ -107,11 +148,8 @@ void fbf_reconstruct_command(struct fbf_axis *axis, double gamma[],
 void fbf_commit_coefficients(struct fbf_axis *axis, double gamma[]);
 
 // Hybrid residual learning and delayed preview prediction.
-void fbf_hybrid_reset(struct fbf_axis *axis, double initial_position,
-                      double regularization, int warmup_samples);
-int fbf_hybrid_train_residual_sample(struct fbf_axis *axis, double nominal,
-                                     double residual,
-                                     long long sample_index);
+void fbf_hybrid_reset_prediction(struct fbf_axis *axis);
+void fbf_hybrid_invalidate_snapshot_caches(struct fbf_axis *axis);
 int fbf_hybrid_lookup_nominal_prediction(struct fbf_controller *controller,
                                          int axis_index, double print_time,
                                          double *nominal);
