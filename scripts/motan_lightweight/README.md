@@ -36,6 +36,25 @@ python3 scripts/motan_lightweight/data_logger.py \
 
 ## Evaluation data collection procedure
 
+The evaluation printer used the following host motion-buffer settings. These
+lines must be added to its existing `[printer]` section in `printer.cfg`:
+
+```ini
+[printer]
+# Keep enough motion queued while Motan and FBF are running.
+buffer_time_low: 4.0
+buffer_time_high: 8.0
+buffer_time_start: 8.0
+move_flush_time: 0.05
+```
+
+The `[printer]` heading is shown for context; do not create a second section if
+one already exists. These were the final values used for the reported
+evaluation runs. Increasing them further would add delay between online hybrid
+learning and the motion that can use the learned weights, while reducing them
+could make the computationally demanding 35 Hz tests more vulnerable to
+motion-buffer starvation.
+
 Each evaluation capture was started from an SSH session on the printer. A
 unique run name identified the motion frequency, controller and repetition:
 
